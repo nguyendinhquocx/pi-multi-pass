@@ -35,7 +35,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
 - **Opt-in routing trace**: Record recent selection, skip, and failover decisions only when requested
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
-- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits` (Anthropic, Codex, Google)
+- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits` (Anthropic, Codex, Google); Codex Free can expose a 30-day window, while Plus/Pro commonly expose 5-hour and weekly windows
 - **Experimental offline OAuth sharing**: Copy one selected account using QR frames or a single copy/paste export string (no network required)
 - **Opt-in token keeper**: One OAuth refresh per machine instead of one per pi process, so parallel sessions cannot burn each other's rotating refresh tokens (`/subs keeper`)
 - **Smarter retries**: Preserve failover progress across internal replay retries
@@ -67,16 +67,21 @@ Set `asProvider: true` on a pool to register its name as one provider in Pi's
 `asProvider` is omitted; an explicit `false` disables that convention. The
 member accounts stay registered for OAuth and `/subs` management, but their
 individual model catalogs are hidden. Pool models inherit `contextWindow`
-overrides from the base provider in `models.json`. Each request resolves auth
-from an available pool member; a rate-limit error benches that member and
+overrides from the base provider in `models.json`. Individual subscription
+models inherit the same base-provider overrides by default; an account-specific
+override wins. Each request resolves auth from an available pool member; a rate-limit error benches that member and
 retries via the next one. The base provider remains visible as its own provider.
 Pool names must not shadow a supported or built-in provider id (for example
 `openrouter`); a colliding pool keeps its member catalogs visible instead of
 breaking failover, and a member shared with a standard pool keeps its catalog
 for that pool.
 
-Use `/pool provider` or the pool's action menu to toggle this setting. The UI
-language defaults to Vietnamese; `/subs lang` toggles Vietnamese/English and
+Use `/pool provider` or the pool's action menu to toggle this setting. The
+`/subs switch` picker puts each account email first so similar provider labels
+remain distinguishable. `/subs add` → Yes prepares `/login` in the TUI editor;
+press Enter and select the new account in Pi's built-in OAuth wizard.
+
+The UI language defaults to Vietnamese; `/subs lang` toggles Vietnamese/English and
 persists `lang` in `~/.pi/agent/multi-pass.json`.
 
 ## Quick start

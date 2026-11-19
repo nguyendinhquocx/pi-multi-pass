@@ -9,6 +9,12 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const source = await readFile(join(root, "extensions", "multi-sub.ts"), "utf8");
 
+function piCommand(args) {
+	if (process.platform !== "win32") return ["pi", args];
+	const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+	return ["bash", ["-lc", `pi ${args.map(quote).join(" ")}`]];
+}
+
 // Rotated credentials are written inside the same lock that produced them.
 assert.match(source, /const run = withAuthFile\(async \(stored\) => \{/);
 assert.match(source, /stored\[account\] = \{ \.\.\.current, \.\.\.refreshed, type: "oauth" \};\n\t\treturn \{ value: refreshed, changed: true \};/);
@@ -67,25 +73,22 @@ try {
 	};
 	writeFileSync(authPath, JSON.stringify(credential));
 
-	const result = spawnSync(
-		"pi",
-		[
-			"--mode", "rpc",
-			"--offline",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
-			"--extension", join(root, "extensions", "multi-sub.ts"),
-		],
-		{
-			cwd: root,
-			env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
-			input: '{"id":"keeper","type":"prompt","message":"/subs status"}\n',
-			encoding: "utf8",
-			timeout: 15_000,
-		},
-	);
+	const [command, args] = piCommand([
+		"--mode", "rpc",
+		"--offline",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-context-files",
+		"--extension", join(root, "extensions", "multi-sub.ts"),
+	]);
+	const result = spawnSync(command, args, {
+		cwd: root,
+		env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+		input: '{"id":"keeper","type":"prompt","message":"/subs status"}\n',
+		encoding: "utf8",
+		timeout: 15_000,
+	});
 
 	assert.equal(result.error, undefined, result.error?.message);
 	assert.equal(result.status, 0, result.stderr);

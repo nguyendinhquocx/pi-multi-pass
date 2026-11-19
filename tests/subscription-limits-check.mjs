@@ -1,48 +1,6 @@
 import assert from "node:assert/strict";
 
-function normalizeCodexUsageWindow(window) {
-  if (!window || typeof window !== "object" || Array.isArray(window)) return undefined;
-  return {
-    usedPercent: typeof window.used_percent === "number" ? window.used_percent : 0,
-    windowSeconds: typeof window.limit_window_seconds === "number" ? window.limit_window_seconds : 0,
-    resetAt: typeof window.reset_at === "number" ? window.reset_at : undefined,
-  };
-}
-
-function matchesUsageWindow(window, expectedSeconds) {
-  if (!window) return false;
-  return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
-}
-
-function parseCodexUsageSnapshot(data) {
-  const rateLimit = data?.rate_limit || {};
-  const windows = [
-    normalizeCodexUsageWindow(rateLimit.primary_window),
-    normalizeCodexUsageWindow(rateLimit.secondary_window),
-  ].filter(Boolean);
-  return {
-    planType: typeof data?.plan_type === "string" ? data.plan_type : "unknown",
-    email: typeof data?.email === "string" ? data.email : "",
-    fiveHour: windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60)),
-    weekly: windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60)),
-  };
-}
-
-function getCodexWindowRemaining(window) {
-  if (!window) return undefined;
-  return Math.max(0, Math.min(100, 100 - window.usedPercent));
-}
-
-function classifyCodexQuotaKind(snapshot) {
-  const values = [getCodexWindowRemaining(snapshot.fiveHour), getCodexWindowRemaining(snapshot.weekly)]
-    .filter((value) => value !== undefined);
-  if (values.length === 0) return { kind: "error", score: 0 };
-  const bottleneck = Math.min(...values);
-  if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
-  if (bottleneck <= 15) return { kind: "low", score: bottleneck };
-  if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
-  return { kind: "ready", score: bottleneck };
-}
+import { classifyCodexQuotaKind, getCodexWindowRemaining, parseCodexUsageSnapshot } from "../lib/codex-quota.ts";
 
 function normalizeGoogleRemainingPercent(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
@@ -170,6 +128,20 @@ function subDisplayName(entry) {
 }
 
 function runWindowClassificationChecks() {
+  const freeSnapshot = parseCodexUsageSnapshot({
+    plan_type: "free",
+    rate_limit: {
+      primary_window: {
+        used_percent: 9,
+        limit_window_seconds: 30 * 24 * 60 * 60,
+        reset_at: Math.floor(Date.now() / 1000) + 20 * 24 * 60 * 60,
+      },
+    },
+  });
+  assert.equal(freeSnapshot.monthly.windowSeconds, 30 * 24 * 60 * 60);
+  assert.equal(getCodexWindowRemaining(freeSnapshot.monthly), 91);
+  assert.deepEqual(classifyCodexQuotaKind(freeSnapshot), { kind: "ready", score: 91 });
+
   const resetAt = Math.floor(Date.now() / 1000) + 3600;
   const snapshot = parseCodexUsageSnapshot({
     plan_type: "pro",

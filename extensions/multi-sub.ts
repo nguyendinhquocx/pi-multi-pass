@@ -49,6 +49,9 @@ import lockfile from "proper-lockfile";
 import { decodeShareText, encodeShareFrames, encodeShareText, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
 import { setMultiPassLanguage, translateUiText, translateUiValue, type MultiPassLanguage } from "../lib/i18n.ts";
 import { chooseVirtualPoolMember, isVirtualPool } from "../lib/virtual-pool.ts";
+import { classifyCodexQuotaKind, getCodexWindowRemaining, parseCodexUsageSnapshot } from "../lib/codex-quota.ts";
+import { prepareBuiltinLogin } from "../lib/login-handoff.ts";
+import { formatSubscriptionChoiceLabel } from "../lib/subscription-labels.ts";
 import { configuredModelOverride, matchesCatalogModel, mergeCatalog, minimaxBase, minimaxChoiceRank, ordinaryModelChoices, type CatalogEntry } from "../lib/model-choices.ts";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
@@ -689,12 +692,6 @@ interface ProviderQuotaChecker {
 	check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult>;
 }
 
-interface CodexUsageWindow {
-	usedPercent: number;
-	windowSeconds: number;
-	resetAt?: number;
-}
-
 interface AnthropicUsageWindow {
 	/** Window label, e.g. "5h", "7d", or "7d Opus" for model-scoped limits */
 	label: string;
@@ -706,13 +703,6 @@ interface AnthropicUsageSnapshot {
 	planType: string;
 	email: string;
 	windows: AnthropicUsageWindow[];
-}
-
-interface CodexUsageSnapshot {
-	planType: string;
-	email: string;
-	fiveHour?: CodexUsageWindow;
-	weekly?: CodexUsageWindow;
 }
 
 interface GoogleGeminiQuotaResponse {
@@ -778,46 +768,6 @@ function getCodexTokenMetadata(accessToken: string): {
 	const planType = typeof auth?.chatgpt_plan_type === "string" ? auth.chatgpt_plan_type : undefined;
 	const email = typeof profile?.email === "string" ? profile.email : undefined;
 	return { accountId, planType, email };
-}
-
-function normalizeCodexUsageWindow(window: unknown): CodexUsageWindow | undefined {
-	const raw = getRecord(window);
-	if (!raw) return undefined;
-	const usedPercent = typeof raw.used_percent === "number" ? raw.used_percent : 0;
-	const windowSeconds = typeof raw.limit_window_seconds === "number" ? raw.limit_window_seconds : 0;
-	const resetAt = typeof raw.reset_at === "number" ? raw.reset_at : undefined;
-	return {
-		usedPercent,
-		windowSeconds,
-		resetAt,
-	};
-}
-
-function matchesUsageWindow(window: CodexUsageWindow | undefined, expectedSeconds: number): boolean {
-	if (!window) return false;
-	return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
-}
-
-function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
-	const raw = getRecord(data);
-	const rateLimit = getRecord(raw?.rate_limit);
-	const windows = [
-		normalizeCodexUsageWindow(rateLimit?.primary_window),
-		normalizeCodexUsageWindow(rateLimit?.secondary_window),
-	].filter((window): window is CodexUsageWindow => Boolean(window));
-	const fiveHour = windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60));
-	const weekly = windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60));
-	return {
-		planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
-		email: typeof raw?.email === "string" ? raw.email : "",
-		fiveHour,
-		weekly,
-	};
-}
-
-function getCodexWindowRemaining(window: CodexUsageWindow | undefined): number | undefined {
-	if (!window) return undefined;
-	return Math.max(0, Math.min(100, 100 - window.usedPercent));
 }
 
 /** Parse `rate_limit_reset_credits` from the Codex usage payload. These
@@ -896,23 +846,6 @@ async function readResponseError(response: Response): Promise<string> {
 		// ignore JSON parse errors and fall back to raw text
 	}
 	return `HTTP ${response.status}: ${raw}`;
-}
-
-function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
-	kind: QuotaStatusKind;
-	score: number;
-} {
-	const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
-	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
-	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
-	if (values.length === 0) {
-		return { kind: "error", score: 0 };
-	}
-	const bottleneck = Math.min(...values);
-	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
-	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
-	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
-	return { kind: "ready", score: bottleneck };
 }
 
 function formatQuotaKind(kind: QuotaStatusKind): string {
@@ -1947,12 +1880,27 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			}
 			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+			const monthlyLeft = getCodexWindowRemaining(snapshot.monthly);
 			const classification = classifyCodexQuotaKind(snapshot);
 			const resetCredits = parseCodexResetCredits(rawData);
+			const windowSummaries: string[] = [];
+			const windowDetails: string[] = [];
+			if (snapshot.fiveHour) {
+				windowSummaries.push(`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour.resetAt)})`);
+				windowDetails.push(`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour.resetAt)}`);
+			}
+			if (snapshot.weekly) {
+				windowSummaries.push(`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly.resetAt)})`);
+				windowDetails.push(`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly.resetAt)}`);
+			}
+			if (snapshot.monthly) {
+				windowSummaries.push(`30d ${formatRemainingPercent(monthlyLeft)} (${formatResetShort(snapshot.monthly.resetAt)})`);
+				windowDetails.push(`30-day window: ${formatRemainingPercent(monthlyLeft)} left, resets ${formatResetLong(snapshot.monthly.resetAt)}`);
+			}
+			if (windowSummaries.length === 0) windowSummaries.push("usage windows unavailable");
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
-				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
-				`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly?.resetAt)})`,
+				...windowSummaries,
 				formatQuotaKind(classification.kind),
 			].join(" | ");
 			const details = [
@@ -1964,10 +1912,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			if (snapshot.email) {
 				details.push(`email: ${snapshot.email}`);
 			}
-			details.push(
-				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
-				`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
-			);
+			details.push(...windowDetails);
 			if (resetCredits) {
 				const base = `${resetCredits.available} stored reset${resetCredits.available === 1 ? "" : "s"}`;
 				details.push(resetCredits.applicable > 0
@@ -1981,6 +1926,9 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			}
 			if (snapshot.weekly) {
 				windows.push({ label: "7d", remainingPercent: weeklyLeft, resetAt: snapshot.weekly.resetAt });
+			}
+			if (snapshot.monthly) {
+				windows.push({ label: "30d", remainingPercent: monthlyLeft, resetAt: snapshot.monthly.resetAt });
 			}
 			const remainingValues = windows
 				.map((w) => w.remainingPercent)
@@ -2206,6 +2154,7 @@ function renderQuotaCardLines(
 function formatWindowLabel(id: string): string {
 	if (id === "5h") return "5-hour window";
 	if (id === "7d") return "weekly";
+	if (id === "30d") return "30-day window";
 	if (id.startsWith("7d ")) return `weekly \u00b7 ${id.slice(3)}`;
 	return id;
 }
@@ -2888,6 +2837,12 @@ function subModelName(entry: SubEntry, originalName: string): string {
 
 function cloneModels(originalProvider: string, index: number, entry?: SubEntry) {
 	const models = getModels(originalProvider as any) as Model<Api>[];
+	const contextWindowOverrides = entry
+		? {
+			...storedContextWindowOverrides(entry.provider),
+			...storedContextWindowOverrides(subProviderName(entry)),
+		}
+		: storedContextWindowOverrides(originalProvider);
 	return models.map((m) => ({
 		id: m.id,
 		name: entry ? subModelName(entry, m.name) : `${m.name} (#${index})`,
@@ -2896,7 +2851,7 @@ function cloneModels(originalProvider: string, index: number, entry?: SubEntry) 
 		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
 		input: m.input as ("text" | "image")[],
 		cost: { ...m.cost },
-		contextWindow: m.contextWindow,
+		contextWindow: contextWindowOverrides[m.id] ?? m.contextWindow,
 		maxTokens: m.maxTokens,
 		headers: m.headers ? { ...m.headers } : undefined,
 		compat: m.compat,
@@ -2939,8 +2894,13 @@ function storedOverlayModels(baseProvider: string): Model<Api>[] {
  */
 function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
 	const catalog = subscriptionCatalog(entry.provider);
+	const contextWindowOverrides = {
+		...storedContextWindowOverrides(entry.provider),
+		...storedContextWindowOverrides(name),
+	};
 	const models = catalog.map(({ model }) => ({
 		...model,
+		contextWindow: contextWindowOverrides[model.id] ?? model.contextWindow,
 		provider: name,
 		name: subModelName(entry, model.name),
 	}));
@@ -4261,29 +4221,40 @@ function getSwitchableProviderOptions(
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
 	const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd);
 	const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
+	const authStorage = getAuthStorage(ctx);
 	const options: Array<{ providerName: string; label: string; description: string }> = [];
 	const seen = new Set<string>();
 	const push = (providerName: string, label: string, description: string) => {
 		if (allowed && !allowed.has(providerName)) return;
-		if (!getAuthStorage(ctx).hasAuth(providerName)) return;
+		if (!authStorage.hasAuth(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		options.push({ providerName, label, description });
 	};
 
 	for (const providerName of SUPPORTED_PROVIDERS) {
+		const providerLabel = PROVIDER_TEMPLATES[providerName]?.displayName || providerName;
 		push(
 			providerName,
-			PROVIDER_TEMPLATES[providerName]?.displayName || providerName,
+			formatSubscriptionChoiceLabel(providerLabel, getStoredAccountEmail(providerName, authStorage)),
 			"base provider",
 		);
 	}
 	for (const entry of allSubs) {
-		push(subProviderName(entry), subDisplayName(entry), "extra subscription");
+		const name = subProviderName(entry);
+		const label = formatSubscriptionChoiceLabel(
+			subDisplayName(entry),
+			getStoredAccountEmail(name, authStorage),
+		);
+		push(name, label, "extra subscription");
 	}
 	for (const pool of loadEffectiveConfig(ctx.cwd).pools) {
 		if (pool.enabled && isVirtualPool(pool)) {
-			push(pool.name, `${pool.name} (Pool)`, `${pool.members.length} members`);
+			const memberEmails = pool.members
+				.map((member) => getStoredAccountEmail(member, authStorage))
+				.filter((email): email is string => Boolean(email));
+			const memberDescription = `${pool.members.length} members${memberEmails.length > 0 ? ` · ${memberEmails.join(", ")}` : ""}`;
+			push(pool.name, `${pool.name} (Pool)`, memberDescription);
 		}
 	}
 	return options;
@@ -5089,14 +5060,11 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 
 	const loginNow = await ctx.ui.confirm(
 		subDisplayName(entry),
-		`Created ${subDisplayName(entry)}.\n\nLogin now?`,
+		`Created ${subDisplayName(entry)}.\n\nPrepare /login? Press Enter to choose the account.`,
 	);
 
 	if (loginNow) {
-		ctx.ui.notify(
-			`Use /login and select "${subscriptionLoginName(entry)}" to authenticate.`,
-			"info",
-		);
+		prepareBuiltinLogin(ctx.ui, ctx.mode, subscriptionLoginName(entry));
 	} else {
 		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
 	}
@@ -5194,10 +5162,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 		providersRequiringReauthentication.delete(selectedProviderName);
 	}
 
-	ctx.ui.notify(
-		`Use /login and select "${subscriptionLoginName(entry)}" to authenticate.`,
-		"info",
-	);
+	prepareBuiltinLogin(ctx.ui, ctx.mode, subscriptionLoginName(entry));
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {

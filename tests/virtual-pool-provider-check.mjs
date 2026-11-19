@@ -43,7 +43,7 @@ try {
     pools: [{
       name: "openai-codex-free",
       baseProvider: "openai-codex",
-      members: ["openai-codex-2", "openai-codex-3"],
+      members: ["openai-codex-3"],
       enabled: true,
     }],
     chains: [],
@@ -57,6 +57,7 @@ try {
   writeFileSync(join(agentDir, "models.json"), JSON.stringify({
     providers: {
       "openai-codex": { modelOverrides: { "gpt-6-luna": { contextWindow: 1_050_000 } } },
+      "openai-codex-2": { modelOverrides: { "gpt-6-luna": { contextWindow: 900_000 } } },
     },
   }));
 
@@ -80,8 +81,8 @@ try {
     .map((line) => line.trim().split(/\s+/)[0]);
   assert.ok(providers.includes("openai-codex"), "base provider should remain in /model catalog");
   assert.ok(providers.includes("openai-codex-free"), "virtual pool should appear as one provider");
-  assert.ok(!providers.includes("openai-codex-2"), "pool child #2 should be hidden");
-  assert.ok(!providers.includes("openai-codex-3"), "pool child #3 should be hidden");
+  assert.ok(providers.includes("openai-codex-2"), "the Plus account outside the Free pool must remain selectable");
+  assert.ok(!providers.includes("openai-codex-3"), "the Free pool member should be hidden behind the virtual provider");
   const virtualLuna = (result.stdout || "").split(/\r?\n/).find((line) => line.includes("openai-codex-free") && line.includes("gpt-6-luna"));
   assert.match(virtualLuna || "", /1\.1M/, "virtual provider should inherit the base provider's contextWindow override");
 
@@ -120,7 +121,7 @@ try {
     pools: [{
       name: "openai-codex-free",
       baseProvider: "openai-codex",
-      members: ["openai-codex-2", "openai-codex-3"],
+      members: ["openai-codex-3"],
       enabled: true,
     }],
     chains: [],
@@ -153,8 +154,8 @@ try {
   const availableProviders = availableResponse.data.models.map((model) => model.provider);
   assert.ok(availableProviders.includes("openai-codex"), "base Plus provider should remain selectable");
   assert.ok(availableProviders.includes("openai-codex-free"), "virtual provider should be available without its own login");
-  assert.ok(!availableProviders.includes("openai-codex-2"), "hidden child models should not be selectable");
-  assert.ok(!availableProviders.includes("openai-codex-3"), "hidden child models should not be selectable");
+  assert.ok(availableProviders.includes("openai-codex-2"), "the Plus account outside the Free pool remains selectable");
+  assert.ok(!availableProviders.includes("openai-codex-3"), "the Free pool member remains hidden behind the pool provider");
 
   const poolToggle = await runPiKeepingInputOpen([
     "--mode", "rpc",
@@ -216,6 +217,10 @@ try {
     .map((line) => line.trim().split(/\s+/)[0]);
   assert.ok(!restoredProviders.includes("openai-codex-free"), "explicit false disables the free-pool convention");
   assert.ok(restoredProviders.includes("openai-codex-2"), "disabling Virtual Pool Provider restores child providers");
+  const account2Luna = (restoredCatalog.stdout || "").split(/\r?\n/).find((line) => line.includes("openai-codex-2") && line.includes("gpt-6-luna"));
+  const account3Luna = (restoredCatalog.stdout || "").split(/\r?\n/).find((line) => line.includes("openai-codex-3") && line.includes("gpt-6-luna"));
+  assert.match(account2Luna || "", /900K/, "account-specific contextWindow override should take precedence");
+  assert.match(account3Luna || "", /1\.1M/, "new accounts should inherit the base provider contextWindow override");
 
   // A missing legacy config defaults to Vietnamese and `/subs lang` persists the toggle.
   rmSync(join(agentDir, "multi-pass.json"));
