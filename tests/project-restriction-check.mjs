@@ -4,6 +4,10 @@ function subProviderName(entry) {
   return `${entry.provider}-${entry.index}`;
 }
 
+function isVirtualPool(pool) {
+  return pool.asProvider ?? pool.name === `${pool.baseProvider}-free`;
+}
+
 function normalizeEntries(entries) {
   const byProvider = new Map();
   for (const entry of entries) {
@@ -56,10 +60,15 @@ function filterPoolsByAllowedProviders(pools, allowedProviderNames) {
   }
   const allowed = new Set(allowedProviderNames);
   return pools
-    .map((pool) => ({
-      ...pool,
-      members: pool.members.filter((member) => allowed.has(member)),
-    }))
+    .map((pool) => {
+      // Allowing the virtual pool provider by name keeps its members intact:
+      // virtual providers authenticate through the pool, not per member.
+      if (isVirtualPool(pool) && allowed.has(pool.name)) return pool;
+      return {
+        ...pool,
+        members: pool.members.filter((member) => allowed.has(member)),
+      };
+    })
     .filter((pool) => pool.members.length > 0);
 }
 
@@ -184,7 +193,39 @@ function runUnrestrictedEnvMergeCheck() {
   assert.equal(effective.allowedProviderNames, undefined);
 }
 
+function runVirtualPoolNameAllowlistCheck() {
+  const globalConfig = {
+    subscriptions: [{ provider: "openai-codex", index: 2 }],
+    pools: [
+      {
+        name: "openai-codex-free",
+        baseProvider: "openai-codex",
+        members: ["openai-codex-2"],
+        enabled: true,
+        asProvider: true,
+      },
+    ],
+    chains: [
+      { name: "primary", enabled: true, entries: [{ pool: "openai-codex-free", model: "gpt-6-luna", enabled: true }] },
+    ],
+  };
+
+  // Allowing the virtual pool provider by name must keep the pool (and its chain) intact.
+  const effective = buildEffectiveConfig(globalConfig, { allowedSubs: ["openai-codex-free"] });
+  assert.deepEqual(effective.pools, [{
+    name: "openai-codex-free",
+    baseProvider: "openai-codex",
+    members: ["openai-codex-2"],
+    enabled: true,
+    asProvider: true,
+  }]);
+  assert.deepEqual(effective.chains, [
+    { name: "primary", enabled: true, entries: [{ pool: "openai-codex-free", model: "gpt-6-luna", enabled: true }] },
+  ]);
+}
+
 runExactProviderRestrictionCheck();
 runBaseProviderAllowedCheck();
 runUnrestrictedEnvMergeCheck();
+runVirtualPoolNameAllowlistCheck();
 console.log("project restriction checks passed");

@@ -99,14 +99,52 @@ function formatFailoverExhausted(poolName, currentProvider) {
   return `[pool:${poolName}] Failover exhausted after ${currentProvider}; no eligible target remained in this cascade.`;
 }
 
-const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+// Mirrors pi's real retry decision: pi-ai provider retry classifier + agent retry settings.
+const NON_RETRYABLE_PROVIDER_LIMIT_PATTERN = [
+	"GoUsageLimitError", "FreeUsageLimitError", "Monthly usage limit reached", "available balance",
+	"insufficient_quota", "out of budget", "quota exceeded", "billing",
+	"subscription_sharing_usage_limit_exceeded",
+	"subscription_sharing_workplace_individual_usage_limit_exceeded",
+	'"code"\\s*:\\s*"?1308(?![0-9])',
+].join("|");
 
-function piWillRetryTurn(errorMessage) {
-  const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
-  const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
-  const status = leading ? Number(leading[1]) : field ? Number(field[1]) : undefined;
-  if (status === undefined) return true;
-  return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+const RETRYABLE_PROVIDER_PATTERN = [
+	"overloaded", "server_busy", "servers are currently busy", "currently experiencing high demand",
+	"model is at capacity", "rate.?limit", "too many requests",
+	"(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
+	"service.?(?:is.?)?(?:temporarily.?)?unavailable", "server.?error", "internal.?error",
+	"provider.?returned.?(?:an.?)?error",
+	"exceeded request buffer limit while retrying upstream",
+	"unable to forward upstream", "upstream.?request.?failed", "upstream_stream_read_error",
+	"stream was interrupted", "http/?2 stream failed",
+	"network.?error", "connection.?error", "connection.?refused", "connection.?lost",
+	"connection.?closed", "other side closed", "fetch failed",
+	"request to \\S+ failed, reason:", "getaddrinfo",
+	"(?<![a-z0-9_])(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)(?![a-z0-9_])",
+	"connection reset by peer", "ENOTFOUND", "EAI_AGAIN", "upstream.?connect",
+	"reset before headers", "socket hang up", "socket connection was closed",
+	"timed? out", "timeout", "terminated",
+	"websocket.?closed", "websocket.?error", "websocket.?connection.?limit.?reached",
+	"ended without", "stream ended before message_stop",
+	"stream ended before a terminal response event", "http2 request did not get a response",
+	"stream disconnected before completion", "cut short after the reply had begun",
+	"pending stream has been canceled", "retry delay",
+	"you can retry your request", "try your request again", "please retry your request",
+	"ResourceExhausted", "subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable",
+].join("|");
+
+const AGENT_RETRY_SETTINGS = { enabled: true, maxRetries: 3 };
+
+function isRetryableAssistantError(errorMessage) {
+	if (!errorMessage) return false;
+	if (new RegExp(NON_RETRYABLE_PROVIDER_LIMIT_PATTERN, "i").test(errorMessage)) return false;
+	return new RegExp(RETRYABLE_PROVIDER_PATTERN, "i").test(errorMessage);
+}
+
+function piWillRetryTurn(errorMessage, failedRotations) {
+	if (!AGENT_RETRY_SETTINGS.enabled) return false;
+	if (failedRotations >= AGENT_RETRY_SETTINGS.maxRetries) return false;
+	return isRetryableAssistantError(errorMessage);
 }
 
 class RuntimeHarness {
@@ -393,7 +431,9 @@ class RuntimeHarness {
 
     this.notify(formatFailoverTransition(pool.name, currentModel.provider, nextCandidate), "info");
     this.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-    if (prompt && !piWillRetryTurn(errorMessage)) {
+    const failedRotations = Math.max(cascade.attemptedProviders.size - 1, 0);
+    const willRetry = piWillRetryTurn(errorMessage, failedRotations);
+    if (prompt && !willRetry) {
       this.suppressNextStartTurn = true;
       this.sendUserMessage(prompt, { deliverAs: "followUp" });
     }
@@ -573,7 +613,10 @@ async function runNoLoopChecks() {
     "google-gemini-cli:gemini-2.5-pro",
   ]);
   assert.deepEqual(snapshot.visitedChainIndexes, [1, 2]);
-  assert.deepEqual(snapshot.sentPrompts, []);
+  // After maxRetries (3) failed rotations pi stops retrying, so the extension replays
+  // the prompt itself to keep the cascade going.
+  assert.deepEqual(snapshot.sentPrompts, ["write migration guide"]);
+  assert.deepEqual(snapshot.sentPromptOptions, [{ deliverAs: "followUp" }]);
 
   const warningMessages = snapshot.notifications
     .filter((entry) => entry.level === "warning")

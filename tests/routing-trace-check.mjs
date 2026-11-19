@@ -16,7 +16,7 @@ const agentDir = mkdtempSync(join(tmpdir(), "pi-multi-pass-trace-"));
 try {
 	writeFileSync(
 		join(agentDir, "multi-pass.json"),
-		JSON.stringify({ subscriptions: [], pools: [], chains: [], presets: [] }),
+		JSON.stringify({ subscriptions: [], pools: [], chains: [], presets: [], lang: "en" }),
 	);
 
 	const commands = [
@@ -27,25 +27,28 @@ try {
 		["stopped", "/pool trace status"],
 	].map(([id, message]) => JSON.stringify({ id, type: "prompt", message })).join("\n");
 
-	const result = spawnSync(
-		"pi",
-		[
-			"--mode", "rpc",
-			"--offline",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
-			"--extension", join(root, "extensions", "multi-sub.ts"),
-		],
-		{
-			cwd: root,
-			env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
-			input: `${commands}\n`,
-			encoding: "utf8",
-			timeout: 15_000,
-		},
-	);
+	function piCommand(args) {
+		if (process.platform !== "win32") return ["pi", args];
+		const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+		return ["bash", ["-lc", `pi ${args.map(quote).join(" ")}`]];
+	}
+
+	const [piBin, piArgs] = piCommand([
+		"--mode", "rpc",
+		"--offline",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-context-files",
+		"--extension", join(root, "extensions", "multi-sub.ts"),
+	]);
+	const result = spawnSync(piBin, piArgs, {
+		cwd: root,
+		env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+		input: `${commands}\n`,
+		encoding: "utf8",
+		timeout: 15_000,
+	});
 
 	assert.equal(result.error, undefined, result.error?.message);
 	assert.equal(result.status, 0, result.stderr);

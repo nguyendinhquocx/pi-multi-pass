@@ -47,6 +47,8 @@ import {
 import { homedir } from "os";
 import lockfile from "proper-lockfile";
 import { decodeShareText, encodeShareFrames, encodeShareText, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
+import { setMultiPassLanguage, translateUiText, translateUiValue, type MultiPassLanguage } from "../lib/i18n.ts";
+import { chooseVirtualPoolMember, isVirtualPool } from "../lib/virtual-pool.ts";
 import { configuredModelOverride, matchesCatalogModel, mergeCatalog, minimaxBase, minimaxChoiceRank, ordinaryModelChoices, type CatalogEntry } from "../lib/model-choices.ts";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
@@ -72,7 +74,8 @@ import {
 	getBuiltinModels as getModels,
 } from "@earendil-works/pi-ai/providers/all";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai";
+import type { Api, Model, AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	Container,
 	Input,
@@ -89,7 +92,54 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 
-// ==========================================================================
+const localizedUiContexts = new WeakSet<object>();
+
+function installLocalizedUi(ctx: ExtensionContext | ExtensionCommandContext): void {
+	const ui = ctx.ui as unknown as Record<string, unknown>;
+	if (localizedUiContexts.has(ui)) return;
+	const wrap = (name: string, factory: (method: (...args: any[]) => any) => (...args: any[]) => any) => {
+		const method = ui[name];
+		if (typeof method !== "function") return;
+		Object.defineProperty(ui, name, {
+			configurable: true,
+			writable: true,
+			value: factory(method.bind(ui)),
+		});
+	};
+	try {
+		wrap("select", (method) => async (title: string, options: string[], ...rest: unknown[]) => {
+			// Translated labels may collide ("Account"/"Accounts" → "Tài khoản"); keep the
+			// original option for collisions so selection still maps back to the right value.
+			const seen = new Set<string>();
+			const visibleOptions = options.map((option) => {
+				const translated = translateUiText(option);
+				if (seen.has(translated)) return option;
+				seen.add(translated);
+				return translated;
+			});
+			const reverse = new Map(visibleOptions.map((visible, index) => [visible, options[index]]));
+			const selected = await method(translateUiText(title), visibleOptions, ...rest);
+			return selected === undefined ? undefined : reverse.get(selected) ?? selected;
+		});
+		wrap("confirm", (method) => (title: string, message: string, ...rest: unknown[]) =>
+			method(translateUiText(title), translateUiText(message), ...rest));
+		wrap("input", (method) => (title: string, placeholder?: string, ...rest: unknown[]) =>
+			method(translateUiText(title), placeholder ? translateUiText(placeholder) : placeholder, ...rest));
+		wrap("notify", (method) => (message: string, ...rest: unknown[]) => method(translateUiText(message), ...rest));
+		wrap("setTitle", (method) => (title: string) => method(translateUiText(title)));
+		wrap("setWorkingMessage", (method) => (message?: string) => method(message ? translateUiText(message) : message));
+		wrap("setHiddenThinkingLabel", (method) => (label?: string) => method(label ? translateUiText(label) : label));
+		wrap("editor", (method) => (title: string, prefill?: string, ...rest: unknown[]) => method(translateUiText(title), prefill, ...rest));
+		wrap("setStatus", (method) => (key: string, text?: string) => method(key, text ? translateUiText(text) : text));
+		wrap("setWidget", (method) => (key: string, content: unknown, ...rest: unknown[]) =>
+			method(key, Array.isArray(content) ? content.map((line) => typeof line === "string" ? translateUiText(line) : line) : content, ...rest));
+		localizedUiContexts.add(ui);
+	} catch {
+		// A frozen UI context still gets localization in custom selector helpers.
+	}
+}
+
+// ========================================================================
 // Provider templates
 // ==========================================================================
 
@@ -361,6 +411,7 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
+const BUILTIN_PROVIDER_IDS = new Set(builtinProviders().map((provider) => provider.id));
 
 // ==========================================================================
 // Built-in quota checking
@@ -867,17 +918,17 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 function formatQuotaKind(kind: QuotaStatusKind): string {
 	switch (kind) {
 		case "ready":
-			return "ready";
+			return translateUiText("ready");
 		case "watch":
-			return "watch";
+			return translateUiText("watch");
 		case "low":
-			return "low";
+			return translateUiText("low");
 		case "blocked":
-			return "blocked";
+			return translateUiText("blocked");
 		case "missing-auth":
-			return "not logged in";
+			return translateUiText("not logged in");
 		default:
-			return "error";
+			return translateUiText("error");
 	}
 }
 
@@ -1025,19 +1076,26 @@ async function showWrappedSelect(
 	},
 ): Promise<string | undefined> {
 	if (options.items.length === 0) return undefined;
+	const title = translateUiText(options.title);
+	const subtitle = options.subtitle ? translateUiText(options.subtitle) : undefined;
+	const items = options.items.map((item) => ({
+		...item,
+		label: translateUiText(item.label),
+		description: item.description ? translateUiText(item.description) : undefined,
+	}));
 
 	if (!ctx.hasUI) {
-		const renderedItems = options.items.map((item) =>
+		const renderedItems = items.map((item) =>
 			item.description ? `${item.label} — ${item.description}` : item.label,
 		);
-		const selected = await ctx.ui.select(options.title, renderedItems);
+		const selected = await ctx.ui.select(title, renderedItems);
 		if (!selected) return undefined;
 		const index = renderedItems.indexOf(selected);
-		return index >= 0 ? options.items[index]?.value : undefined;
+		return index >= 0 ? items[index]?.value : undefined;
 	}
 
-	const confirmHint = options.confirmHint || "select";
-	const cancelHint = options.cancelHint || "close";
+	const confirmHint = translateUiText(options.confirmHint || "select");
+	const cancelHint = translateUiText(options.cancelHint || "close");
 
 	const selectedValue = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
 		const container = new Container();
@@ -1047,19 +1105,19 @@ async function showWrappedSelect(
 		].join(" • ");
 
 		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-		container.addChild(new Text(theme.fg("accent", theme.bold(options.title))));
-		if (options.subtitle) {
-			container.addChild(new Text(theme.fg("dim", options.subtitle)));
+		container.addChild(new Text(theme.fg("accent", theme.bold(title))));
+		if (subtitle) {
+			container.addChild(new Text(theme.fg("dim", subtitle)));
 		}
 
-		const selectList = new SelectList(options.items, Math.min(options.items.length, 10), {
+		const selectList = new SelectList(items, Math.min(items.length, 10), {
 			selectedPrefix: (text) => theme.fg("accent", text),
 			selectedText: (text) => theme.fg("accent", text),
 			description: (text) => theme.fg("muted", text),
 			scrollInfo: (text) => theme.fg("dim", text),
 			noMatch: (text) => theme.fg("warning", text),
 		});
-		selectList.setSelectedIndex(getWrappedSelectIndex(options.items, options.initialValue));
+		selectList.setSelectedIndex(getWrappedSelectIndex(items, options.initialValue));
 		selectList.onSelect = (item) => done(item.value);
 		selectList.onCancel = () => done(null);
 		container.addChild(selectList);
@@ -1076,19 +1134,19 @@ async function showWrappedSelect(
 			handleInput(data: string) {
 				const current = selectList.getSelectedItem();
 				const currentIndex = current
-					? options.items.findIndex((item) => item.value === current.value)
+					? items.findIndex((item) => item.value === current.value)
 					: 0;
 
-				if (matchesKey(data, Key.up) && options.items.length > 1 && currentIndex === 0) {
-					selectList.setSelectedIndex(options.items.length - 1);
+				if (matchesKey(data, Key.up) && items.length > 1 && currentIndex === 0) {
+					selectList.setSelectedIndex(items.length - 1);
 					tui.requestRender();
 					return;
 				}
 
 				if (
 					matchesKey(data, Key.down)
-					&& options.items.length > 1
-					&& currentIndex === options.items.length - 1
+					&& items.length > 1
+					&& currentIndex === items.length - 1
 				) {
 					selectList.setSelectedIndex(0);
 					tui.requestRender();
@@ -1133,7 +1191,7 @@ async function loadQuotaResults(
 		const loader = new BorderedLoader(
 			tui,
 			theme,
-			`Checking limits across ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}...`,
+			translateUiText(`Checking limits across ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}...`),
 		);
 		loader.onAbort = () => done(null);
 
@@ -2059,12 +2117,12 @@ function renderQuotaBar(
 	const coloredBar = theme.fg(colorKey, bar);
 	const percentText = percent === undefined
 		? "--"
-		: `${Math.round(percent)}% left`;
+		: translateUiText(`${Math.round(percent)}% left`);
 	const coloredPercent = theme.fg(colorKey, theme.bold(percentText));
 	const resetText = window.resetAt
-		? theme.fg("dim", `  resets ${formatResetShort(window.resetAt)}`)
+		? theme.fg("dim", `  ${translateUiText("resets")} ${formatResetShort(window.resetAt)}`)
 		: "";
-	const paddedLabel = theme.fg("muted", label.padEnd(14));
+	const paddedLabel = theme.fg("muted", translateUiText(label).padEnd(14));
 	return `${paddedLabel}  ${coloredBar}  ${coloredPercent}${resetText}`;
 }
 
@@ -2102,11 +2160,13 @@ function renderQuotaCardLines(
 	if (result.planType && result.planType !== "unknown") metaParts.push(result.planType);
 	if (result.email) metaParts.push(result.email);
 	if (result.projectId) metaParts.push(`project ${result.projectId}`);
-	const meta = metaParts.length > 0 ? theme.fg("dim", `  ${metaParts.join(" \u00b7 ")}`) : "";
+	const meta = metaParts.length > 0
+		? theme.fg("dim", translateUiText(`  ${metaParts.join(" \u00b7 ")}`))
+		: "";
 
 	const badges: string[] = [];
-	if (options.isCurrent) badges.push(theme.fg("accent", theme.bold("active")));
-	if (options.isBest && !options.isCurrent) badges.push(theme.fg("success", "best now"));
+	if (options.isCurrent) badges.push(theme.fg("accent", theme.bold(translateUiText("active"))));
+	if (options.isBest && !options.isCurrent) badges.push(theme.fg("success", translateUiText("best now")));
 	const badgeText = badges.length > 0 ? ` ${badges.join(" \u00b7 ")}` : "";
 
 	const lines: string[] = [];
@@ -2123,12 +2183,12 @@ function renderQuotaCardLines(
 	}
 
 	if (windows.length === 0 && models.length === 0) {
-		lines.push(theme.fg("muted", `    ${result.summary}`));
+		lines.push(theme.fg("muted", `    ${translateUiText(result.summary)}`));
 	}
 
 	if (result.resetCredits) {
 		const rc = result.resetCredits;
-		const base = `${rc.available} stored reset${rc.available === 1 ? "" : "s"}`;
+		const base = translateUiText(`${rc.available} stored reset${rc.available === 1 ? "" : "s"}`);
 		if (rc.applicable > 0) {
 			lines.push(`    ${theme.fg("success", theme.bold(`\u21ba ${base} \u00b7 usable now!`))}`);
 		} else {
@@ -2136,7 +2196,7 @@ function renderQuotaCardLines(
 		}
 	}
 	if (result.extraUsage) {
-		lines.push(`    ${theme.fg("dim", "extra usage enabled")}`);
+		lines.push(`    ${theme.fg("dim", translateUiText("extra usage enabled"))}`);
 	}
 	return lines;
 }
@@ -2174,14 +2234,14 @@ async function selectQuotaResultCards(
 		const container = new Container();
 		let selectedIndex = initialIndex >= 0 ? initialIndex : 0;
 
-		const header = new Text(theme.fg("accent", theme.bold("Subscription Limits")), 1, 0);
-		const overview = new Text(theme.fg("dim", formatQuotaOverview(results)), 1, 0);
+		const header = new Text(theme.fg("accent", theme.bold(translateUiText("Subscription Limits"))), 1, 0);
+		const overview = new Text(theme.fg("dim", translateUiText(formatQuotaOverview(results))), 1, 0);
 		const cardsContainer = new Container();
 		const footer = new Text(theme.fg("dim", [
 			keyHint("tui.select.up", "up"),
 			keyHint("tui.select.down", "down"),
-			keyHint("tui.select.confirm", "details"),
-			keyHint("tui.select.cancel", "close"),
+			keyHint("tui.select.confirm", translateUiText("details")),
+			keyHint("tui.select.cancel", translateUiText("close"))
 		].join(" \u2022 ")), 1, 0);
 
 		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
@@ -2366,6 +2426,8 @@ interface PresetConfig {
 interface PoolConfig {
 	/** Pool name (user-defined) */
 	name: string;
+	/** Expose this pool as one provider in Pi's /model catalog. */
+	asProvider?: boolean;
 	/** Base provider type, e.g. "openai-codex" */
 	baseProvider: string;
 	/** Provider names in rotation order. Includes the original (e.g. "openai-codex")
@@ -2416,6 +2478,8 @@ interface MultiPassConfig {
 	/** Renew OAuth tokens ahead of pi and persist every rotation. Off by
 	 * default; takes over refreshes pi would otherwise do itself. */
 	tokenKeeper?: boolean;
+	/** UI language; absent legacy values default to Vietnamese. */
+	lang?: MultiPassLanguage;
 }
 
 /** Project-level config (.pi/multi-pass.json) */
@@ -2451,7 +2515,7 @@ function projectConfigPath(cwd: string): string {
 }
 
 function emptyMultiPassConfig(): MultiPassConfig {
-	return { subscriptions: [], pools: [], chains: [], presets: [] };
+	return { subscriptions: [], pools: [], chains: [], presets: [], lang: "vi" };
 }
 
 function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
@@ -2464,6 +2528,7 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 		statusBar: parsed.statusBar === true,
 		interceptModel: parsed.interceptModel === true,
 		tokenKeeper: parsed.tokenKeeper === true,
+		lang: parsed.lang === "en" ? "en" : "vi",
 	};
 }
 
@@ -2512,10 +2577,15 @@ function filterPoolsByAllowedProviders(
 	}
 	const allowed = new Set(allowedProviderNames);
 	return pools
-		.map((pool) => ({
-			...pool,
-			members: pool.members.filter((member) => allowed.has(member)),
-		}))
+		.map((pool) => {
+			// Allowing the virtual pool provider by name keeps its members intact:
+			// virtual providers authenticate through the pool, not per member.
+			if (isVirtualPool(pool) && allowed.has(pool.name)) return pool;
+			return {
+				...pool,
+				members: pool.members.filter((member) => allowed.has(member)),
+			};
+		})
 		.filter((pool) => pool.members.length > 0);
 }
 
@@ -2632,7 +2702,8 @@ function getProjectScopedProviderNames(
 				(entry) => subProviderName(entry) === providerName,
 			);
 			const isSupportedBaseProvider = SUPPORTED_PROVIDERS.includes(providerName);
-			if (!isExtraSubscription && !isSupportedBaseProvider) continue;
+			const isVirtualPoolProvider = effective.pools.some((pool) => pool.name === providerName && isVirtualPool(pool));
+			if (!isExtraSubscription && !isSupportedBaseProvider && !isVirtualPoolProvider) continue;
 			push(providerName);
 		}
 		return providerNames;
@@ -2645,6 +2716,9 @@ function getProjectScopedProviderNames(
 	}
 	for (const entry of effective.subscriptions) {
 		push(subProviderName(entry));
+	}
+	for (const pool of effective.pools) {
+		if (pool.enabled && isVirtualPool(pool) && getAuthStorage(ctx).hasAuth(pool.name)) push(pool.name);
 	}
 	return providerNames;
 }
@@ -2662,6 +2736,12 @@ function findSelectableModelForProvider(
 		if (preferred) {
 			return preferred as Model<Api>;
 		}
+	}
+	const virtualPool = loadEffectiveConfig(ctx.cwd).pools.find(
+		(pool) => pool.name === providerName && pool.enabled && isVirtualPool(pool),
+	);
+	if (virtualPool) {
+		return ctx.modelRegistry.getAll().find((model) => model.provider === providerName) as Model<Api> | undefined;
 	}
 	const baseProvider = getBaseProvider(providerName);
 	if (!baseProvider) {
@@ -2922,7 +3002,7 @@ function providerModelChoices(ctx: ExtensionContext | ExtensionCommandContext, p
 // Register a single subscription as a provider
 // ==========================================================================
 
-function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
+function registerSub(pi: ExtensionAPI, entry: SubEntry, hideFromCatalog = false): void {
 	const template = PROVIDER_TEMPLATES[entry.provider];
 	if (!template) return;
 
@@ -2940,9 +3020,9 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index, entry);
+	const models = hideFromCatalog ? [] : cloneModels(entry.provider, entry.index, entry);
 
-	mirroredCatalogs.set(name, builtinModels.map((model, index) => ({
+	mirroredCatalogs.set(name, hideFromCatalog ? [] : builtinModels.map((model, index) => ({
 		origin: "builtin",
 		model: { ...model, ...models[index], provider: name },
 	})));
@@ -2957,7 +3037,7 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 		apiKey: template.apiKey,
 		oauth: oauth && modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
-		refreshModels: async () => liveSubscriptionModels(entry, name),
+		refreshModels: async () => hideFromCatalog ? [] : liveSubscriptionModels(entry, name),
 	};
 	subscriptionRegistrations.set(name, registration);
 	pi.registerProvider(name, registration);
@@ -2994,19 +3074,31 @@ function isTerminalOAuthRefreshError(errorMessage: string): boolean {
 	return TERMINAL_OAUTH_REFRESH_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
-const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+// Mirror of pi's own agent-turn retry decision (agent-session.ts):
+// retry only when the setting is enabled, the retry budget is not spent,
+// the error is not a context overflow (compaction handles that), and the
+// provider error is retryable per pi-ai's shared classifier.
+const DEFAULT_AGENT_RETRY_SETTINGS = { enabled: true, maxRetries: 3 };
 
-function parseHttpStatus(errorMessage: string): number | undefined {
-	const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
-	if (leading) return Number(leading[1]);
-	const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
-	return field ? Number(field[1]) : undefined;
+function getAgentRetrySettings(): { enabled: boolean; maxRetries: number } {
+	try {
+		const retry = SettingsManager.create(process.cwd(), getAgentDir()).getRetrySettings();
+		return { enabled: retry.enabled, maxRetries: retry.maxRetries };
+	} catch {
+		return DEFAULT_AGENT_RETRY_SETTINGS;
+	}
 }
 
-function piWillRetryTurn(errorMessage: string): boolean {
-	const status = parseHttpStatus(errorMessage);
-	if (status === undefined) return true;
-	return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+function piWillRetryTurn(
+	assistantMessage: Pick<AssistantMessage, "stopReason" | "errorMessage" | "provider">,
+	contextWindow: number | undefined,
+	failedRotations: number,
+): boolean {
+	const settings = getAgentRetrySettings();
+	if (!settings.enabled) return false;
+	if (failedRotations >= settings.maxRetries) return false;
+	if (isContextOverflow(assistantMessage as AssistantMessage, contextWindow)) return false;
+	return isRetryableAssistantError(assistantMessage as AssistantMessage);
 }
 
 // ==========================================================================
@@ -3207,8 +3299,12 @@ async function runCustomSelector(
 // ==========================================================================
 
 interface PoolState {
-	/** Current index into pool.members */
+	/** Next pool member index for round-robin selection. */
 	currentIndex: number;
+	/** Member used by the most recent virtual-provider request. */
+	activeMember?: string;
+	/** Member chosen by failover and reserved for the next retry. */
+	preferredNextMember?: string;
 	/** Members that are temporarily "exhausted" (hit limit), with timestamps */
 	exhausted: Map<string, number>;
 	/** Cooldown period in ms before retrying an exhausted member */
@@ -3221,6 +3317,13 @@ interface RoutingTraceEntry {
 }
 
 const MAX_ROUTING_TRACE_ENTRIES = 100;
+
+function parseHttpStatus(errorMessage: string): number | undefined {
+	const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
+	if (leading) return Number(leading[1]);
+	const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
+	return field ? Number(field[1]) : undefined;
+}
 
 function summarizeTraceError(errorMessage: string): string {
 	const status = parseHttpStatus(errorMessage);
@@ -3282,6 +3385,8 @@ class PoolManager {
 		if (!state) {
 			state = {
 				currentIndex: 0,
+				activeMember: undefined,
+				preferredNextMember: undefined,
 				exhausted: new Map(),
 				cooldownMs: 5 * 60 * 1000, // 5 min default cooldown
 			};
@@ -3302,6 +3407,8 @@ class PoolManager {
 
 			const state = this.getOrCreatePoolState(pool.name);
 			state.currentIndex = pool.members.length > 0 ? state.currentIndex % pool.members.length : 0;
+			if (state.activeMember && !pool.members.includes(state.activeMember)) state.activeMember = undefined;
+			if (state.preferredNextMember && !pool.members.includes(state.preferredNextMember)) state.preferredNextMember = undefined;
 			for (const member of Array.from(state.exhausted.keys())) {
 				if (!pool.members.includes(member)) {
 					state.exhausted.delete(member);
@@ -3312,6 +3419,7 @@ class PoolManager {
 			for (const member of pool.members) {
 				this.providerToPool.set(member, pool.name);
 			}
+			if (isVirtualPool(pool)) this.providerToPool.set(pool.name, pool.name);
 		}
 
 		for (const poolName of Array.from(this.poolStates.keys())) {
@@ -3325,6 +3433,39 @@ class PoolManager {
 	getPoolForProvider(providerName: string): PoolConfig | undefined {
 		const poolName = this.providerToPool.get(providerName);
 		return poolName ? this.pools.get(poolName) : undefined;
+	}
+
+	getActiveVirtualMember(poolName: string): string | undefined {
+		return this.getOrCreatePoolState(poolName).activeMember;
+	}
+
+	selectVirtualMember(
+		poolName: string,
+		authStorage: { hasAuth(provider: string): boolean },
+	): string | undefined {
+		const pool = this.pools.get(poolName);
+		if (!pool || !isVirtualPool(pool) || pool.members.length === 0) return undefined;
+		const state = this.getOrCreatePoolState(poolName);
+		const available = new Set(this.getAvailableMembers(pool, authStorage));
+		const choice = chooseVirtualPoolMember(
+			pool.members,
+			state.currentIndex,
+			available,
+			state.preferredNextMember,
+		);
+		state.preferredNextMember = undefined;
+		if (!choice) return undefined;
+		state.activeMember = choice.member;
+		state.currentIndex = choice.nextIndex;
+		this.recordTrace(`[pool:${pool.name}] selected virtual member ${choice.member}`);
+		return choice.member;
+	}
+
+	reserveVirtualMember(poolName: string, member: string): boolean {
+		const pool = this.pools.get(poolName);
+		if (!pool || !isVirtualPool(pool) || !pool.members.includes(member)) return false;
+		this.getOrCreatePoolState(poolName).preferredNextMember = member;
+		return true;
 	}
 
 	/** Get available (non-exhausted, authenticated) members of a pool */
@@ -3390,14 +3531,17 @@ class PoolManager {
 		const skips: FailoverSkip[] = [];
 		const candidates: FailoverCandidate[] = [];
 		const poolSize = pool.members.length;
-		const currentIndex = pool.members.indexOf(currentModel.provider);
-		const startIndex = currentIndex >= 0 ? currentIndex : 0;
+		const currentProvider = isVirtualPool(pool) && currentModel.provider === pool.name
+			? this.getActiveVirtualMember(pool.name)
+			: currentModel.provider;
+		const currentIndex = currentProvider ? pool.members.indexOf(currentProvider) : -1;
+		const startIndex = currentIndex >= 0 ? currentIndex : Math.max(0, (this.getOrCreatePoolState(pool.name).currentIndex - 1 + poolSize) % Math.max(1, poolSize));
 
 		for (let step = 1; step <= poolSize; step++) {
 			const candidateIndex = poolSize <= 0 ? -1 : (startIndex + step) % poolSize;
 			if (candidateIndex < 0) break;
 			const candidate = pool.members[candidateIndex];
-			if (candidate === currentModel.provider) continue;
+			if (candidate === currentProvider) continue;
 			if (attemptedProviders.has(candidate)) {
 				skips.push({
 					type: "pool-member",
@@ -3519,10 +3663,11 @@ class PoolManager {
 	}
 
 	/** Mark a member as exhausted (hit rate limit) */
-	markExhausted(providerName: string): void {
-		const poolName = this.providerToPool.get(providerName);
-		if (!poolName) return;
-		const state = this.getOrCreatePoolState(poolName);
+	markExhausted(providerName: string, explicitPoolName?: string): void {
+		const poolName = explicitPoolName ?? this.providerToPool.get(providerName);
+		const pool = poolName ? this.pools.get(poolName) : undefined;
+		if (!pool || !pool.members.includes(providerName)) return;
+		const state = this.getOrCreatePoolState(poolName!);
 		state.exhausted.set(providerName, Date.now());
 	}
 
@@ -3610,6 +3755,9 @@ class PoolManager {
 		lastUserPrompt: string | null,
 	): Promise<void> {
 		const strategy = pool.strategy || "round-robin";
+		const currentProvider = isVirtualPool(pool) && currentModel.provider === pool.name
+			? this.getActiveVirtualMember(pool.name) ?? currentModel.provider
+			: currentModel.provider;
 		if (strategy === "round-robin") return;
 
 		const poolCandidates = plan.candidates.filter(
@@ -3621,7 +3769,7 @@ class PoolManager {
 			try {
 				const best = await this.getQuotaBestMember(
 					pool,
-					currentModel.provider,
+					currentProvider,
 					getAuthStorage(ctx),
 					cascade.attemptedProviders,
 				);
@@ -3676,7 +3824,7 @@ class PoolManager {
 				const best = await runCustomSelector(
 					pool,
 					available,
-					currentModel.provider,
+					currentProvider,
 					currentModel.id,
 					lastUserPrompt || undefined,
 				);
@@ -3778,6 +3926,7 @@ class PoolManager {
 		ctx: ExtensionContext,
 		lastUserPrompt: string | null,
 		config: MultiPassConfig,
+		retryContext?: { contextWindow?: number },
 	): Promise<boolean> {
 		if (!currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
@@ -3787,9 +3936,14 @@ class PoolManager {
 
 		this.recordTrace(`${currentModel.provider} failed with ${summarizeTraceError(errorMessage)}`);
 		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
+		const currentPoolMember = isVirtualPool(pool) && currentModel.provider === pool.name
+			? this.getActiveVirtualMember(pool.name)
+			: currentModel.provider;
+		if (!currentPoolMember) return false;
 
-		// Mark current as exhausted before planning the forward-only cascade.
-		this.markExhausted(currentModel.provider);
+		// Mark the actual account as exhausted, even when the model is the virtual pool provider.
+		this.markExhausted(currentPoolMember, pool.name);
+		cascade.attemptedProviders.add(currentPoolMember);
 
 		const plan = this.buildFailoverPlan(
 			currentModel,
@@ -3823,32 +3977,41 @@ class PoolManager {
 
 		const nextCandidate = plan.candidates[0];
 		if (!nextCandidate) {
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
+			ctx.ui.notify(formatFailoverExhausted(pool.name, currentPoolMember), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			this.recordTrace(`failover exhausted in pool ${pool.name}`);
 			return false;
 		}
 
-		const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
+		const nextPool = config.pools.find((candidate) => candidate.name === nextCandidate.poolName);
+		const nextUsesVirtualProvider = nextPool ? isVirtualPool(nextPool) : false;
+		const nextProviderName = nextUsesVirtualProvider && nextPool ? nextPool.name : nextCandidate.provider;
+		const nextModel = ctx.modelRegistry.find(nextProviderName, nextCandidate.modelId);
 		if (!nextModel) {
 			ctx.ui.notify(
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
 				"warning",
 			);
 			this.recordTrace(`${nextCandidate.provider} skipped because model ${nextCandidate.modelId} is unavailable`);
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
+			ctx.ui.notify(formatFailoverExhausted(pool.name, currentPoolMember), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
 		}
 
-		const success = await this.pi.setModel(nextModel);
+		const staysOnVirtualProvider = nextUsesVirtualProvider && currentModel.provider === nextProviderName;
+		const reservedVirtualMember = nextUsesVirtualProvider && nextPool
+			? this.reserveVirtualMember(nextPool.name, nextCandidate.provider)
+			: false;
+		const success = staysOnVirtualProvider
+			? reservedVirtualMember
+			: await this.pi.setModel(nextModel);
 		if (!success) {
 			ctx.ui.notify(
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
 				"warning",
 			);
 			this.recordTrace(`${nextCandidate.provider} skipped because authentication was unavailable`);
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
+			ctx.ui.notify(formatFailoverExhausted(pool.name, currentPoolMember), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
 		}
@@ -3859,7 +4022,7 @@ class PoolManager {
 		}
 
 		ctx.ui.notify(
-			formatFailoverTransition(pool.name, currentModel.provider, nextCandidate),
+			formatFailoverTransition(pool.name, currentPoolMember, nextCandidate),
 			"info",
 		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
@@ -3868,11 +4031,20 @@ class PoolManager {
 			: `pool ${nextCandidate.poolName} (${pool.strategy || "round-robin"})`;
 		this.recordTrace(`selected ${nextCandidate.provider} (${nextCandidate.modelId}) via ${route}`);
 
-		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
+		// Mirror pi's retry decision: after this many failed rotations in the same turn,
+		// pi's retry budget is spent, so the extension must replay the prompt itself.
+		const failedRotations = Math.max(cascade.attemptedProviders.size - 1, 0);
+		const assistantError = {
+			stopReason: "error" as const,
+			errorMessage,
+			provider: currentModel.provider,
+		};
+		const willRetry = piWillRetryTurn(assistantError, retryContext?.contextWindow, failedRotations);
+		if (lastUserPrompt && !willRetry) {
 			this.suppressNextStartTurn = true;
 			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
 			this.recordTrace("queued follow-up because pi will not retry this error");
-		} else if (piWillRetryTurn(errorMessage)) {
+		} else if (willRetry) {
 			this.recordTrace("waiting for pi to retry the turn");
 		} else {
 			this.recordTrace("turn cannot be replayed because no prompt was captured");
@@ -3890,7 +4062,155 @@ class PoolManager {
 	}
 }
 
-// ==========================================================================
+const virtualPoolProviderNames = new Set<string>();
+let extensionApiForCatalog: ExtensionAPI | undefined;
+let runtimeModelRegistry: ExtensionContext["modelRegistry"] | undefined;
+let runtimeAuthStorage: AuthStorageCompat | undefined;
+const VIRTUAL_POOL_API_KEY = "pi-multi-pass-virtual-pool";
+
+function storedContextWindowOverrides(provider: string): Record<string, number> {
+	try {
+		const modelsPath = join(getAgentDir(), "models.json");
+		if (!existsSync(modelsPath)) return {};
+		const config = JSON.parse(readFileSync(modelsPath, "utf8")) as {
+			providers?: Record<string, { modelOverrides?: Record<string, { contextWindow?: unknown }> }>;
+		};
+		const overrides = config.providers?.[provider]?.modelOverrides;
+		if (!overrides) return {};
+		return Object.fromEntries(
+			Object.entries(overrides).filter((entry): entry is [string, { contextWindow: number }] =>
+				typeof entry[1]?.contextWindow === "number" &&
+				Number.isFinite(entry[1].contextWindow) &&
+				entry[1].contextWindow > 0,
+			).map(([modelId, override]) => [modelId, override.contextWindow]),
+		);
+	} catch {
+		return {};
+	}
+}
+
+function virtualPoolModels(pool: PoolConfig): Model<Api>[] {
+	const runtimeModels = runtimeModelRegistry?.getAll().filter((model) => model.provider === pool.baseProvider);
+	const models = runtimeModels && runtimeModels.length > 0
+		? runtimeModels
+		: subscriptionCatalog(pool.baseProvider).map(({ model }) => model);
+	const contextWindowOverrides = storedContextWindowOverrides(pool.baseProvider);
+	return models.map((model) => ({
+		...model,
+		contextWindow: contextWindowOverrides[model.id] ?? model.contextWindow,
+		provider: pool.name,
+	}));
+}
+
+function registerVirtualPoolProvider(
+	pi: ExtensionAPI,
+	pool: PoolConfig,
+	poolManager: PoolManager,
+): boolean {
+	if (!pool.enabled || !isVirtualPool(pool) || !PROVIDER_TEMPLATES[pool.baseProvider]) return false;
+	if (SUPPORTED_PROVIDERS.includes(pool.name) || BUILTIN_PROVIDER_IDS.has(pool.name)) return false;
+	if (!virtualPoolProviderNames.has(pool.name)) {
+		const configured = runtimeModelRegistry?.getRegisteredProviderConfig(pool.name)
+			|| runtimeModelRegistry?.getRegisteredNativeProvider(pool.name);
+		if (configured) return false;
+		try {
+			const modelsPath = join(getAgentDir(), "models.json");
+			const models = existsSync(modelsPath) ? JSON.parse(readFileSync(modelsPath, "utf8")) : {};
+			if (models?.providers && Object.hasOwn(models.providers, pool.name)) return false;
+		} catch {
+			// A broken optional override file must not block pool registration.
+		}
+	}
+	const models = virtualPoolModels(pool);
+	const firstModel = models[0];
+	if (!firstModel?.api || !firstModel.baseUrl) return false;
+	const providerConfig = {
+		name: `${pool.name} (Pool)`,
+		baseUrl: firstModel.baseUrl,
+		api: firstModel.api,
+		// Pi needs an auth method to make this provider selectable. This sentinel
+		// is never sent: streamSimple removes it and resolves member auth normally.
+		apiKey: VIRTUAL_POOL_API_KEY,
+		models: models.map(({ provider: _provider, ...model }) => ({ ...model, api: firstModel.api })),
+		refreshModels: async () => virtualPoolModels(pool).map(({ provider: _provider, ...model }) => ({ ...model, api: firstModel.api })),
+		streamSimple: (model: Model<Api>, context: any, options?: any) => {
+			const registry = runtimeModelRegistry;
+			if (!registry) throw new Error(`Virtual Pool "${pool.name}" is not ready: model runtime context is unavailable`);
+			const authStorage = runtimeAuthStorage ?? {
+				hasAuth: (provider: string) => Boolean(readStoredCredential(provider)),
+				get: (provider: string) => readStoredCredential(provider) as AuthStorageEntry | undefined,
+				logout: async () => { throw new Error("Credential logout is unavailable"); },
+			};
+			const member = poolManager.selectVirtualMember(pool.name, authStorage);
+			if (!member) throw new Error(`Virtual Pool "${pool.name}" has no authenticated, available members`);
+			const baseModel = registry.find(pool.baseProvider, model.id) as Model<Api> | undefined;
+			let memberModel = {
+				...model,
+				...(baseModel ? { api: baseModel.api, baseUrl: baseModel.baseUrl, headers: baseModel.headers, compat: baseModel.compat } : {}),
+				provider: member,
+			} as Model<Api>;
+			const credential = authStorage.get(member);
+			const modifyModels = PROVIDER_TEMPLATES[pool.baseProvider]?.buildModifyModels?.(member);
+			if (credential && modifyModels) {
+				memberModel = modifyModels([memberModel], credential as OAuthCredentials)[0] ?? memberModel;
+			}
+			const { apiKey: _poolKey, headers: poolHeaders, ...memberOptions } = options ?? {};
+			const headers = poolHeaders && typeof poolHeaders === "object"
+				? Object.fromEntries(Object.entries(poolHeaders).filter(([name]) =>
+					!new Set(["authorization", "x-api-key", "x-goog-api-key", "chatgpt-account-id"]).has(name.toLowerCase()),
+				))
+				: undefined;
+			return registry.streamSimple(memberModel, context as never, {
+				...memberOptions,
+				...(headers ? { headers } : {}),
+			} as never);
+		},
+	};
+	pi.registerProvider(pool.name, providerConfig);
+	virtualPoolProviderNames.add(pool.name);
+	return true;
+}
+
+function syncProviderCatalog(
+	pi: ExtensionAPI,
+	subscriptions: SubEntry[],
+	pools: PoolConfig[],
+	poolManager: PoolManager,
+): void {
+	const virtualPools = pools.filter((pool) => pool.enabled && isVirtualPool(pool));
+	const reservedProviderNames = new Set([
+		...SUPPORTED_PROVIDERS,
+		...BUILTIN_PROVIDER_IDS,
+		...subscriptions.map(subProviderName),
+	]);
+	const currentNames = new Set<string>();
+	const registeredVirtualPools: PoolConfig[] = [];
+	for (const pool of virtualPools) {
+		if (reservedProviderNames.has(pool.name)) continue;
+		if (registerVirtualPoolProvider(pi, pool, poolManager)) {
+			currentNames.add(pool.name);
+			registeredVirtualPools.push(pool);
+		}
+	}
+	for (const previousName of virtualPoolProviderNames) {
+		if (currentNames.has(previousName)) continue;
+		pi.unregisterProvider(previousName);
+		virtualPoolProviderNames.delete(previousName);
+	}
+
+	const hiddenMembers = new Set(registeredVirtualPools.flatMap((pool) =>
+		pool.members.filter((member) => member !== pool.baseProvider),
+	));
+	const membersUsedByStandardPools = new Set(pools
+		.filter((pool) => pool.enabled && !isVirtualPool(pool))
+		.flatMap((pool) => pool.members));
+	for (const member of membersUsedByStandardPools) hiddenMembers.delete(member);
+	for (const entry of subscriptions) {
+		registerSub(pi, entry, hiddenMembers.has(subProviderName(entry)));
+	}
+}
+
+// ========================================================================
 // /subs command handlers
 // ==========================================================================
 
@@ -3961,6 +4281,11 @@ function getSwitchableProviderOptions(
 	for (const entry of allSubs) {
 		push(subProviderName(entry), subDisplayName(entry), "extra subscription");
 	}
+	for (const pool of loadEffectiveConfig(ctx.cwd).pools) {
+		if (pool.enabled && isVirtualPool(pool)) {
+			push(pool.name, `${pool.name} (Pool)`, `${pool.members.length} members`);
+		}
+	}
 	return options;
 }
 
@@ -3977,6 +4302,12 @@ function resolveSwitchTargetModel(
 		if (preferred) {
 			return preferred as Model<Api>;
 		}
+	}
+	const virtualPool = loadEffectiveConfig(ctx.cwd).pools.find(
+		(pool) => pool.name === providerName && pool.enabled && isVirtualPool(pool),
+	);
+	if (virtualPool) {
+		return ctx.modelRegistry.getAll().find((model) => model.provider === providerName) as Model<Api> | undefined;
 	}
 	const baseProvider = getBaseProvider(providerName);
 	if (!baseProvider) {
@@ -4024,9 +4355,14 @@ async function handleSubsModel(
 	const items: ModelPickerItem[] = available.map((model) => {
 		const subEntry = subs.find((entry) => subProviderName(entry) === model.provider);
 		const email = getStoredAccountEmail(model.provider, authStorage);
+		const virtualPool = loadEffectiveConfig(ctx.cwd).pools.find(
+			(pool) => pool.name === model.provider && isVirtualPool(pool),
+		);
 		const providerLabel = subEntry
 			? subDisplayName(subEntry)
-			: `${PROVIDER_TEMPLATES[model.provider]?.displayName || model.provider} (built-in)`;
+			: virtualPool
+				? `${virtualPool.name} (Pool)`
+				: `${PROVIDER_TEMPLATES[model.provider]?.displayName || model.provider} (built-in)`;
 		return {
 			model: model as Model<Api>,
 			providerLabel,
@@ -4097,8 +4433,8 @@ async function handleSubsModel(
 		const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
 		const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
 		const footerHint = [
-			keyHint("tui.select.confirm", "switch"),
-			keyHint("tui.select.cancel", "close"),
+			keyHint("tui.select.confirm", translateUiText("switch")),
+			keyHint("tui.select.cancel", translateUiText("close")),
 		].join(" \u2022 ");
 
 		return {
@@ -4120,7 +4456,7 @@ async function handleSubsModel(
 				const lines: string[] = [];
 				const push = (line: string) => lines.push(truncateToWidth(line, width));
 				lines.push(...topBorder.render(width));
-				push(theme.fg("accent", theme.bold(" \u2726 multi-pass \u00b7 switch model")));
+				push(theme.fg("accent", theme.bold(translateUiText(" ✦ multi-pass · switch model"))));
 				push("");
 				for (const inputLine of searchInput.render(Math.max(1, width - 2))) {
 					push(` ${inputLine}`);
@@ -4128,7 +4464,7 @@ async function handleSubsModel(
 				push("");
 
 				if (filtered.length === 0) {
-					push(theme.fg("muted", "   No matching models"));
+					push(theme.fg("muted", `   ${translateUiText("No matching models")}`));
 				} else {
 					const end = Math.min(filtered.length, viewStart + maxVisible);
 					for (let i = viewStart; i < end; i++) {
@@ -4145,7 +4481,7 @@ async function handleSubsModel(
 							item.source === "built-in" ? "muted" : "dim",
 							item.source === "built-in" ? "[built-in]" : "[multi-pass]",
 						);
-						const label = theme.fg("muted", item.providerLabel);
+						const label = theme.fg("muted", translateUiText(item.providerLabel));
 						const email = item.email ? theme.fg("dim", ` \u00b7 ${item.email}`) : "";
 						push(`${cursor}${currentMarker}${name}  ${sourceTag} ${label}${email}`);
 					}
@@ -4289,7 +4625,11 @@ async function renameSubscriptionLabel(
 		return;
 	}
 
-	registerSub(pi, entry);
+	const hidden = loadEffectiveConfig(ctx.cwd).pools.some(
+		(pool) => pool.enabled && isVirtualPool(pool) && pool.members.includes(subProviderName(entry))
+			&& subProviderName(entry) !== pool.baseProvider,
+	);
+	registerSub(pi, entry, hidden);
 	ctx.modelRegistry.refresh();
 
 	ctx.ui.notify(`Updated ${previousName} -> ${nextName}`, "info");
@@ -4331,8 +4671,7 @@ async function removeSubscriptionEntry(
 	);
 
 	saveGlobalConfig(config);
-	ctx.modelRegistry.refresh();
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
 }
 
@@ -4537,8 +4876,8 @@ async function showSubsDashboard(
 		const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
 		const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
 		const footer = [
-			keyHint("tui.select.confirm", "open"),
-			keyHint("tui.select.cancel", "close"),
+			keyHint("tui.select.confirm", translateUiText("open")),
+			keyHint("tui.select.cancel", translateUiText("close")),
 		].join(" \u2022 ");
 
 		const padName = (name: string): string => {
@@ -4551,22 +4890,23 @@ async function showSubsDashboard(
 				const lines: string[] = [];
 				const push = (line: string) => lines.push(truncateToWidth(line, width));
 				lines.push(...topBorder.render(width));
-				push(theme.fg("accent", theme.bold(" \u2726 multi-pass \u00b7 subscriptions")));
+				push(theme.fg("accent", theme.bold(translateUiText(" ✦ multi-pass · subscriptions"))));
 				for (const section of visibleSections) {
 					push("");
-					push(theme.fg("muted", theme.bold(` ${section.heading.toUpperCase()}`)));
+					push(theme.fg("muted", theme.bold(` ${translateUiText(section.heading)}`)));
 					for (const item of section.items) {
 						const index = flat.indexOf(item);
 						const isSelected = index === selectedIndex;
 						const prefix = isSelected ? theme.fg("accent", " \u2192 ") : "   ";
 						const glyph = theme.fg(item.statusColor, item.glyph);
+						const localizedName = translateUiText(item.name);
 						const name = isSelected
-							? theme.fg("accent", theme.bold(padName(item.name)))
-							: padName(item.name);
+							? theme.fg("accent", theme.bold(padName(localizedName)))
+							: padName(localizedName);
 						const status = theme.fg(item.statusColor, item.statusGlyph);
-						const detail = theme.fg("muted", item.detail);
-						const meta = item.meta ? theme.fg("dim", `  \u00b7 ${item.meta}`) : "";
-						const active = item.active ? theme.fg("accent", "  \u2726 active") : "";
+						const detail = theme.fg("muted", translateUiText(item.detail));
+						const meta = item.meta ? theme.fg("dim", `  \u00b7 ${translateUiText(item.meta)}`) : "";
+						const active = item.active ? theme.fg("accent", `  ✦ ${translateUiText("active")}`) : "";
 						push(`${prefix}${glyph} ${name}  ${status} ${detail}${meta}${active}`);
 					}
 				}
@@ -5081,11 +5421,17 @@ function persistPoolConfig(
 	return { action: "created", config };
 }
 
-function reloadPoolManagerForCurrentProject(
+async function reloadPoolManagerForCurrentProject(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
-): void {
-	poolManager.loadPools(loadEffectiveConfig(ctx.cwd).pools);
+): Promise<void> {
+	const effective = loadEffectiveConfig(ctx.cwd);
+	const all = normalizeEntries(mergeConfigs(loadGlobalConfig(), parseEnvConfig()));
+	runtimeModelRegistry = ctx.modelRegistry;
+	runtimeAuthStorage = getAuthStorage(ctx);
+	poolManager.loadPools(effective.pools);
+	if (extensionApiForCatalog) syncProviderCatalog(extensionApiForCatalog, all, effective.pools, poolManager);
+	await ctx.modelRegistry.refresh({ allowNetwork: false });
 }
 
 function renamePoolReferences(
@@ -5150,10 +5496,12 @@ async function renamePoolConfig(
 		return;
 	}
 
+	const wasVirtualProvider = isVirtualPool(pool);
 	pool.name = trimmedName;
+	if (wasVirtualProvider) pool.asProvider = true;
 	const updatedEntries = renamePoolReferences(config.chains, previousName, trimmedName);
 	saveGlobalConfig(config);
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(
 		updatedEntries > 0
 			? `Renamed pool "${previousName}" -> "${trimmedName}" and updated ${updatedEntries} chain entr${updatedEntries === 1 ? "y" : "ies"}.`
@@ -5224,7 +5572,7 @@ async function editPoolMembers(
 			}
 			pool.members = [...selectedMembers];
 			saveGlobalConfig(config);
-			reloadPoolManagerForCurrentProject(ctx, poolManager);
+			await reloadPoolManagerForCurrentProject(ctx, poolManager);
 			ctx.ui.notify(
 				`Updated pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.`,
 				"info",
@@ -5443,7 +5791,7 @@ async function createAndPersistPool(
 	const config = loadGlobalConfig();
 	const persisted = persistPoolConfig(config, pool);
 	saveGlobalConfig(persisted.config);
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 	const resumeSuffix = options?.resumeChainName
 		? ` Chain builder resumed for "${options.resumeChainName}".`
@@ -5565,8 +5913,23 @@ async function togglePoolConfig(
 ): Promise<void> {
 	pool.enabled = !pool.enabled;
 	saveGlobalConfig(config);
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`, "info");
+}
+
+async function togglePoolProviderConfig(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	pool.asProvider = !isVirtualPool(pool);
+	saveGlobalConfig(config);
+	await reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(
+		`Virtual Pool Provider for "${pool.name}" is now ${pool.asProvider ? "enabled" : "disabled"}.`,
+		"info",
+	);
 }
 
 async function changePoolStrategy(
@@ -5675,7 +6038,7 @@ async function changePoolStrategy(
 	}
 
 	saveGlobalConfig(config);
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Pool "${pool.name}" strategy changed to ${nextStrategy}.`, "info");
 }
 
@@ -5703,7 +6066,7 @@ async function removePoolConfig(
 	config.chains = pruned.chains;
 	config.pools = config.pools.filter((candidate) => candidate.name !== pool.name);
 	saveGlobalConfig(config);
-	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	await reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 	let message = `Removed pool "${pool.name}"`;
 	if (removedEntries > 0) {
@@ -5740,6 +6103,11 @@ async function showPoolActions(
 				label: pool.enabled ? "disable" : "enable",
 				description: `Currently ${pool.enabled ? "enabled" : "disabled"}`,
 			},
+			{
+				value: "provider",
+				label: isVirtualPool(pool) ? "Virtual Provider: on" : "Virtual Provider: off",
+				description: "Show this Pool as one Provider in /model and hide its sub-accounts",
+			},
 			{ value: "remove", label: "remove", description: "Delete this pool (subscriptions are kept)" },
 		],
 		confirmHint: "open",
@@ -5765,6 +6133,10 @@ async function showPoolActions(
 	}
 	if (action === "toggle") {
 		await togglePoolConfig(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "provider") {
+		await togglePoolProviderConfig(ctx, poolManager, config, pool);
 		return undefined;
 	}
 	if (action === "remove") {
@@ -5836,6 +6208,35 @@ async function handlePoolToggle(
 	if (idx < 0) return;
 
 	return togglePoolConfig(ctx, poolManager, config, config.pools[idx]);
+}
+
+async function handlePoolProvider(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	requestedName?: string,
+): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.pools.length === 0) {
+		ctx.ui.notify("No pools configured.", "info");
+		return;
+	}
+	let pool = requestedName
+		? config.pools.find((candidate) => candidate.name.toLowerCase() === requestedName.toLowerCase())
+		: undefined;
+	if (requestedName && !pool) {
+		ctx.ui.notify(`Pool "${requestedName}" not found.`, "warning");
+		return;
+	}
+	if (!pool) {
+		const options = config.pools.map((candidate) =>
+			`${candidate.name} — Virtual Provider ${isVirtualPool(candidate) ? "on" : "off"}`,
+		);
+		const selected = await ctx.ui.select("Toggle Virtual Pool Provider", options);
+		if (!selected) return;
+		const index = options.indexOf(selected);
+		pool = index >= 0 ? config.pools[index] : undefined;
+	}
+	if (pool) await togglePoolProviderConfig(ctx, poolManager, config, pool);
 }
 
 async function handlePoolRemove(
@@ -6527,8 +6928,7 @@ async function handlePoolProject(
 		if (!confirmed) return;
 		try {
 			writeFileSync(projectPath, "{}", "utf-8");
-			const effective = loadEffectiveConfig(ctx.cwd);
-			poolManager.loadPools(effective.pools);
+			await reloadPoolManagerForCurrentProject(ctx, poolManager);
 			ctx.ui.notify("Project config cleared. Using global pools.", "info");
 		} catch (err: unknown) {
 			ctx.ui.notify(`Failed: ${err instanceof Error ? err.message : String(err)}`, "error");
@@ -6541,10 +6941,9 @@ async function handlePoolProject(
 		const envEntries = parseEnvConfig();
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
-			...SUPPORTED_PROVIDERS.filter((p) =>
-				getAuthStorage(ctx).hasAuth(p),
-			),
+			...SUPPORTED_PROVIDERS.filter((p) => getAuthStorage(ctx).hasAuth(p)),
 			...allSubs.map((s) => subProviderName(s)),
+			...globalConf.pools.filter((pool) => isVirtualPool(pool)).map((pool) => pool.name),
 		];
 
 		if (allProviderNames.length === 0) {
@@ -6597,9 +6996,7 @@ async function handlePoolProject(
 			allowedSubs: allowed.length > 0 ? allowed : undefined,
 		};
 		saveProjectConfig(ctx.cwd, newProjectConf);
-
-		const effective = loadEffectiveConfig(ctx.cwd);
-		poolManager.loadPools(effective.pools);
+		await reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 		if (allowed.length > 0) {
 			ctx.ui.notify(
@@ -6638,8 +7035,7 @@ async function handlePoolProject(
 			const newProjectConf: ProjectConfig = { ...projectConf };
 			delete newProjectConf.pools;
 			saveProjectConfig(ctx.cwd, newProjectConf);
-			const effective = loadEffectiveConfig(ctx.cwd);
-			poolManager.loadPools(effective.pools);
+			await reloadPoolManagerForCurrentProject(ctx, poolManager);
 			ctx.ui.notify("Project will use global pools.", "info");
 			return;
 		}
@@ -6659,8 +7055,7 @@ async function handlePoolProject(
 
 		const newProjectConf: ProjectConfig = { ...projectConf, pools: projectPools };
 		saveProjectConfig(ctx.cwd, newProjectConf);
-		const effective = loadEffectiveConfig(ctx.cwd);
-		poolManager.loadPools(effective.pools);
+		await reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 		const activeNames = projectPools.map((p) => p.name).join(", ") || "none";
 		ctx.ui.notify(`Project pools: ${activeNames}`, "info");
@@ -6781,6 +7176,7 @@ async function handlePoolMenu(
 		"list     -- Show pools and quick actions",
 		"chain    -- Manage saved fallback chains",
 		"toggle   -- Enable/disable a pool",
+		"provider -- Toggle Virtual Pool Provider",
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
 		"trace    -- Opt-in routing decision trace",
@@ -6800,6 +7196,8 @@ async function handlePoolMenu(
 			return handlePoolChainMenu(ctx, poolManager);
 		case "toggle":
 			return handlePoolToggle(ctx, poolManager);
+		case "provider":
+			return handlePoolProvider(ctx, poolManager);
 		case "remove":
 			return handlePoolRemove(ctx, poolManager);
 		case "status":
@@ -6851,13 +7249,13 @@ async function handleSubsShare(ctx: ExtensionCommandContext): Promise<void> {
 					render(width: number) {
 						const frame = frames[index];
 						const lines = frame.qr.trimEnd().split("\n");
-						return [theme.fg("accent", `OAuth export ${account.providerName} - QR ${frame.index}/${frame.total}`),
+						return [theme.fg("accent", translateUiText(`OAuth export ${account.providerName} - QR ${frame.index}/${frame.total}`)),
 							...(lines.some((line) => visibleWidth(line) > width)
-								? [theme.fg("warning", "Widen terminal to scan the QR, or press u for its URI.")]
+								? [theme.fg("warning", translateUiText("Widen terminal to scan the QR, or press u for its URI."))]
 								: lines),
 							...(showUri ? wrapTextWithAnsi(frame.uri, width) : []),
-							theme.fg("warning", "Bearer credential: a copy of every frame grants account access."),
-							"n/p frames, u reveal frame URI, c full copyable export, Esc close."];
+							theme.fg("warning", translateUiText("Bearer credential: a copy of every frame grants account access.")),
+							translateUiText("n/p frames, u reveal frame URI, c full copyable export, Esc close.")];
 					},
 					invalidate() {},
 					handleInput(data: string) {
@@ -6953,6 +7351,7 @@ async function handleSubsMenu(
 		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
 		{ value: "intercept-model", label: "intercept-model", description: "Route pi's /model to /subs model (replaces editor)" },
 		{ value: "keeper", label: "keeper", description: "Toggle shared OAuth token keeper for parallel pi sessions" },
+		{ value: "lang", label: "Language", description: "Toggle Vietnamese and English" },
 	];
 	let preferredAction = "list";
 
@@ -7011,6 +7410,9 @@ async function handleSubsMenu(
 			case "keeper":
 				await handleSubsKeeper(ctx);
 				break;
+			case "lang":
+				await handleSubsLanguage(ctx);
+				break;
 		}
 	}
 }
@@ -7055,6 +7457,9 @@ async function handlePresetCreate(
 	for (const entry of allSubs) {
 		allProviders.push(subProviderName(entry));
 	}
+	for (const pool of config.pools) {
+		if (pool.enabled && isVirtualPool(pool)) allProviders.push(pool.name);
+	}
 
 	const entries: PresetEntry[] = [];
 	let adding = true;
@@ -7084,12 +7489,15 @@ async function handlePresetCreate(
 		}
 
 		const provider = picked.split(" -- ")[0].trim();
-		const base = getBaseProvider(provider);
+		const virtualPool = config.pools.find((pool) => pool.name === provider && isVirtualPool(pool));
+		const base = getBaseProvider(provider) || virtualPool?.baseProvider;
 		if (!base) continue;
 
-		const models = (minimaxBase(provider)
-			? providerModelChoices(ctx, provider)
-			: getModels(base as any) as Model<Api>[]).map((m) => m.id);
+		const models = (virtualPool
+			? ctx.modelRegistry.getAll().filter((model) => model.provider === provider)
+			: minimaxBase(provider)
+				? providerModelChoices(ctx, provider)
+				: getModels(base as any) as Model<Api>[]).map((m) => m.id);
 		if (models.length === 0) {
 			ctx.ui.notify(`No models available for ${provider}.`, "warning");
 			continue;
@@ -7478,7 +7886,7 @@ function renderStatusBarLine(
 				: "\u2026";
 		const text = `${account.glyph} ${account.shortName} ${status}`;
 		if (ctx.model?.provider === account.providerName) {
-			segments.push(theme.style(text, { fg: "accent", bold: true }));
+			segments.push(theme.fg("accent", theme.bold(text)));
 		} else {
 			const color = quota && quota.kind !== "missing-auth" && quota.kind !== "error"
 				? quotaBarColor(percent)
@@ -7660,6 +8068,17 @@ async function handleSubsInterceptModel(
 	);
 }
 
+async function handleSubsLanguage(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	config.lang = (config.lang ?? "vi") === "vi" ? "en" : "vi";
+	saveGlobalConfig(config);
+	setMultiPassLanguage(config.lang);
+	ctx.ui.notify(
+		config.lang === "vi" ? "Language switched to Vietnamese." : "Language switched to English.",
+		"info",
+	);
+}
+
 async function handleSubsKeeper(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	config.tokenKeeper = !config.tokenKeeper;
@@ -7695,17 +8114,15 @@ export default function multiSub(pi: ExtensionAPI) {
 	startTokenKeeper();
 
 	const config = loadGlobalConfig();
+	setMultiPassLanguage(config.lang);
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
+	extensionApiForCatalog = pi;
 
-	// Register all subscriptions (always global)
-	for (const entry of all) {
-		registerSub(pi, entry);
-	}
-
-	// Initialize pool manager with global pools (updated on session_start with project config)
+	// Register the global pool catalog now; session_start replaces it with project scope.
 	const poolManager = new PoolManager(pi);
 	poolManager.loadPools(config.pools);
+	syncProviderCatalog(pi, all, config.pools, poolManager);
 
 	let projectRestrictionSwitchInFlight = false;
 	const enforceProjectRestriction = async (
@@ -7749,10 +8166,16 @@ export default function multiSub(pi: ExtensionAPI) {
 		return false;
 	};
 
-	// On session start, reload pools with project-level config
+	// On session start, capture runtime auth and reconcile project-scoped providers.
 	pi.on("session_start", async (_event, ctx) => {
+		installLocalizedUi(ctx);
+		runtimeModelRegistry = ctx.modelRegistry;
+		runtimeAuthStorage = getAuthStorage(ctx);
+		setMultiPassLanguage(loadGlobalConfig().lang);
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
+		syncProviderCatalog(pi, all, effective.pools, poolManager);
+		await ctx.modelRegistry.refresh({ allowNetwork: false });
 
 		const statusParts: string[] = [];
 		const enabledChains = effective.chains.filter((chain) => chain.enabled);
@@ -7786,10 +8209,14 @@ export default function multiSub(pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
+		installLocalizedUi(ctx);
+		runtimeModelRegistry = ctx.modelRegistry;
+		runtimeAuthStorage = getAuthStorage(ctx);
 		await enforceProjectRestriction(ctx, "model");
 	});
 
 	pi.on("input", async (event, ctx) => {
+		installLocalizedUi(ctx);
 		if (event.text.trimStart().startsWith("/")) {
 			return { action: "continue" as const };
 		}
@@ -7802,12 +8229,16 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Listen for user input to track last prompt
 	pi.on("before_agent_start", async (event, ctx) => {
-		lastUserPrompt = event.prompt;
-		poolManager.startTurn(event.prompt, ctx.model);
+		const prompt = event.messageType === "user" ? event.prompt : "";
+		lastUserPrompt = prompt || null;
+		poolManager.startTurn(prompt, ctx.model);
 	});
 
 	// Listen for errors to trigger pool rotation
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
+		installLocalizedUi(ctx);
+		runtimeModelRegistry = ctx.modelRegistry;
+		runtimeAuthStorage = getAuthStorage(ctx);
 		if (!event.messages || event.messages.length === 0) return;
 
 		const lastMsg = event.messages[event.messages.length - 1];
@@ -7815,22 +8246,28 @@ export default function multiSub(pi: ExtensionAPI) {
 
 		const assistantMsg = lastMsg as any;
 		const providerName = ctx.model?.provider;
+		// Under a virtual pool the active model's provider is the pool name;
+		// re-auth state is tracked per real member account.
+		const virtualPool = providerName ? poolManager.getPoolForProvider(providerName) : undefined;
+		const memberProviderName = providerName && virtualPool && isVirtualPool(virtualPool) && providerName === virtualPool.name
+			? poolManager.getActiveVirtualMember(virtualPool.name) ?? providerName
+			: providerName;
 		if (assistantMsg.stopReason !== "error") {
-			if (providerName) providersRequiringReauthentication.delete(providerName);
+			if (memberProviderName) providersRequiringReauthentication.delete(memberProviderName);
 			return;
 		}
 		if (!assistantMsg.errorMessage) return;
 
 		const effective = loadEffectiveConfig(ctx.cwd);
 		if (
-			providerName &&
+			memberProviderName &&
 			isTerminalOAuthRefreshError(assistantMsg.errorMessage) &&
-			effective.subscriptions.some((entry) => subProviderName(entry) === providerName) &&
-			getAuthStorage(ctx).get(providerName)?.type === "oauth"
+			effective.subscriptions.some((entry) => subProviderName(entry) === memberProviderName) &&
+			getAuthStorage(ctx).get(memberProviderName)?.type === "oauth"
 		) {
-			providersRequiringReauthentication.add(providerName);
+			providersRequiringReauthentication.add(memberProviderName);
 			ctx.ui.notify(
-				`${getProviderDisplayName(providerName, effective.subscriptions)} needs reauthentication. Run /subs login to replace the rejected credential.`,
+				`${getProviderDisplayName(memberProviderName, effective.subscriptions)} needs reauthentication. Run /subs login to replace the rejected credential.`,
 				"warning",
 			);
 		}
@@ -7846,6 +8283,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				chains: effective.chains,
 				presets: effective.presets,
 			}),
+			{ contextWindow: ctx.model?.contextWindow },
 		);
 
 		if (!rotated && isRateLimitError(assistantMsg.errorMessage)) {
@@ -7869,15 +8307,18 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Register /subs command
 	pi.registerCommand("subs", {
-		description: "Manage extra OAuth subscriptions",
+		description: translateUiText("Manage extra OAuth subscriptions"),
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "share", "receive", "statusbar", "intercept-model", "keeper"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "share", "receive", "statusbar", "intercept-model", "keeper", "lang"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
 				: null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			installLocalizedUi(ctx);
+			runtimeModelRegistry = ctx.modelRegistry;
+			runtimeAuthStorage = getAuthStorage(ctx);
 			const config = loadGlobalConfig();
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const subcommand = (parts[0] || "").toLowerCase();
@@ -7916,6 +8357,9 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "statusbar":
 				case "bar":
 					return handleSubsStatusbar(ctx);
+				case "lang":
+				case "language":
+					return handleSubsLanguage(ctx);
 				case "keeper":
 				case "tokenkeeper":
 					return handleSubsKeeper(ctx);
@@ -7930,15 +8374,18 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Register /pool command
 	pi.registerCommand("pool", {
-		description: "Manage subscription rotation pools",
+		description: translateUiText("Manage subscription rotation pools"),
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "trace", "project"];
+			const subcommands = ["create", "list", "chain", "toggle", "provider", "remove", "status", "trace", "project"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
 				: null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			installLocalizedUi(ctx);
+			runtimeModelRegistry = ctx.modelRegistry;
+			runtimeAuthStorage = getAuthStorage(ctx);
 			const parts = args
 				.trim()
 				.toLowerCase()
@@ -7978,6 +8425,8 @@ export default function multiSub(pi: ExtensionAPI) {
 					}
 				case "toggle":
 					return handlePoolToggle(ctx, poolManager);
+				case "provider":
+					return handlePoolProvider(ctx, poolManager, parts.slice(1).join(" ") || undefined);
 				case "remove":
 				case "rm":
 				case "delete":
@@ -7997,7 +8446,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Register /mp-preset command (namespaced to avoid collision with pi's built-in /preset)
 	pi.registerCommand("mp-preset", {
-		description: "Manage multi-pass model presets (named routing shortcuts across providers)",
+		description: translateUiText("Manage multi-pass model presets (named routing shortcuts across providers)"),
 		getArgumentCompletions: (prefix: string) => {
 			const subcommands = ["activate", "create", "list", "toggle", "remove"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
@@ -8012,6 +8461,9 @@ export default function multiSub(pi: ExtensionAPI) {
 			return presetNames.length > 0 ? presetNames : null;
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			installLocalizedUi(ctx);
+			runtimeModelRegistry = ctx.modelRegistry;
+			runtimeAuthStorage = getAuthStorage(ctx);
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const subcommand = (parts[0] || "").toLowerCase();
 			const rest = parts.slice(1).join(" ");

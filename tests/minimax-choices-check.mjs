@@ -22,15 +22,24 @@ try {
 			{ provider: "minimax-cn", index: 2 },
 			{ provider: "minimax-cn", index: 3 },
 		],
+		// The fixture matches English titles; localization defaults to Vietnamese.
+		lang: "en",
 		pools: [{ name: "global", baseProvider: "minimax", members: ["minimax-2"], enabled: true }],
 		chains: [{ name: "legacy", entries: [{ pool: "global", model: "MiniMax-M2.7", enabled: true }], enabled: true }],
 		presets: [{ name: "legacy", entries: [{ provider: "minimax-2", model: "MiniMax-M2.7", enabled: true }], enabled: true }],
 	}));
-	const child = spawn("pi", [
+	function piCommand(args) {
+		if (process.platform !== "win32") return ["pi", args];
+		const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+		return ["bash", ["-lc", `pi ${args.map(quote).join(" ")}`]];
+	}
+
+	const [piBin, piArgs] = piCommand([
 		"--mode", "rpc", "--offline", "--no-extensions", "--no-skills",
 		"--no-prompt-templates", "--no-context-files", "--extension",
 		join(root, "tests", "fixtures", "minimax-choices.ts"),
-	], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir } });
+	]);
+	const child = spawn(piBin, piArgs, { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir } });
 	let stdout = "", stderr = "";
 	const status = await new Promise((resolve, reject) => {
 		const timer = setTimeout(() => { child.kill(); reject(new Error(stdout + stderr)); }, 60_000);

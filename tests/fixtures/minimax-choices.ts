@@ -28,6 +28,8 @@ export default function (pi) {
 		assert.equal(merged.find((item) => item.model.id === "MiniMax-M2.7")?.origin, "builtin");
 	}
 	writeFileSync(join(getAgentDir(), "models-store.json"), JSON.stringify(overlays));
+	// multi-pass.json is written by the test harness (subscriptions, presets);
+	// it must include lang: "en" so localized titles keep matching this fixture.
 	multiPass({
 		...pi,
 		registerCommand(name, command) { commands.set(name, command); pi.registerCommand(name, command); },

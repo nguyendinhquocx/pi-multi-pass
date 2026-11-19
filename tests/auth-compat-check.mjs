@@ -31,9 +31,13 @@ try {
 		}),
 	);
 
-	const result = spawnSync(
-		"pi",
-		[
+function piCommand(args) {
+	if (process.platform !== "win32") return ["pi", args];
+	const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+	return ["bash", ["-lc", `pi ${args.map(quote).join(" ")}`]];
+}
+
+const [piBin, piArgs] = piCommand([
 			"--mode",
 			"rpc",
 			"--offline",
@@ -43,15 +47,14 @@ try {
 			"--no-context-files",
 			"--extension",
 			join(root, "extensions", "multi-sub.ts"),
-		],
-		{
-			cwd: root,
-			env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
-			input: '{"id":"auth-compat","type":"prompt","message":"/subs status"}\n',
-			encoding: "utf8",
-			timeout: 15_000,
-		},
-	);
+		]);
+	const result = spawnSync(piBin, piArgs, {
+		cwd: root,
+		env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+		input: '{"id":"auth-compat","type":"prompt","message":"/subs status"}\n',
+		encoding: "utf8",
+		timeout: 15_000,
+	});
 
 	assert.equal(result.error, undefined, result.error?.message);
 	assert.equal(result.status, 0, result.stderr);

@@ -29,6 +29,8 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
+- **Virtual Pool Provider**: Expose a pool as one `/model` provider (for example `openai-codex-free`); member providers stay hidden while OAuth credentials remain independently managed
+- **Vietnamese UI**: TUI menus and notifications default to Vietnamese; `/subs lang` toggles Vietnamese/English
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
 - **Opt-in routing trace**: Record recent selection, skip, and failover decisions only when requested
@@ -58,6 +60,25 @@ without M3 or M3.1-Flash keeps every text model it has.
 pi's native `/model` picker is untouched, so with `/subs intercept-model` off you
 can still reach the older models there.
 
+## Virtual Pool Provider and language
+
+Set `asProvider: true` on a pool to register its name as one provider in Pi's
+`/model` catalog. The convention `<baseProvider>-free` also enables it when
+`asProvider` is omitted; an explicit `false` disables that convention. The
+member accounts stay registered for OAuth and `/subs` management, but their
+individual model catalogs are hidden. Pool models inherit `contextWindow`
+overrides from the base provider in `models.json`. Each request resolves auth
+from an available pool member; a rate-limit error benches that member and
+retries via the next one. The base provider remains visible as its own provider.
+Pool names must not shadow a supported or built-in provider id (for example
+`openrouter`); a colliding pool keeps its member catalogs visible instead of
+breaking failover, and a member shared with a standard pool keeps its catalog
+for that pool.
+
+Use `/pool provider` or the pool's action menu to toggle this setting. The UI
+language defaults to Vietnamese; `/subs lang` toggles Vietnamese/English and
+persists `lang` in `~/.pi/agent/multi-pass.json`.
+
 ## Quick start
 
 ```
@@ -66,13 +87,15 @@ can still reach the older models there.
 /subs switch           Manually switch to another subscription/provider
 /subs limits           Check built-in quota support (Anthropic + Codex + Google)
 /pool create           Group subs into a rotation pool (with strategy selection)
+/pool provider         Toggle a pool's Virtual Pool Provider in `/model`
+/subs lang             Toggle Vietnamese/English UI
 /pool chain create     Build an ordered fallback chain across pools
 /pool trace start      Start recording routing decisions for this session
 /mp-preset create         Create a named routing preset across providers
 /mp-preset coding-premium Activate a preset by name
 ```
 
-When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
+When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries. The replay decision mirrors Pi's own retry policy: retry settings (`retry.enabled`/`retry.maxRetries`), pi-ai's retryable-error classifier, and context-overflow handling. Once Pi's retry budget is spent (or the error is non-retryable, like a quota limit), multi-pass replays the captured prompt itself as a follow-up so the cascade continues.
 
 ## Commands
 
@@ -91,6 +114,7 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs share        Show offline QR frames or a full copyable export string (experimental)
 /subs receive      Paste the full string or frame URIs into another pi
 /subs keeper       Toggle the shared OAuth token keeper (off by default)
+/subs lang         Toggle the interface language between Vietnamese and English
 ```
 
 ### `/subs keeper` -- shared OAuth token keeper (opt-in)
@@ -126,6 +150,7 @@ if you actually run several pi sessions at once.
 /pool toggle       Enable/disable a pool
 /pool remove       Delete a pool (keeps subscriptions; prunes linked chain entries)
 /pool status       Member health (logged in, rate limited, cooling down)
+/pool provider     Toggle one pool as a Virtual Pool Provider in `/model`
 /pool trace        Manage the opt-in routing decision trace
 /pool project      Project-level config (restrict subs, override pools/chains)
 ```
@@ -171,7 +196,7 @@ Prompt contents are not recorded.
 
 Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
 
-When `allowedSubs` is set, multi-pass now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names.
+When `allowedSubs` is set, multi-pass now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names. Allowing a Virtual Pool Provider by name keeps its members intact — virtual providers authenticate through the pool, not per member.
 
 ### Use case: separate work and personal accounts
 
@@ -211,7 +236,8 @@ cd ~/side-project
       "name": "work-codex",
       "baseProvider": "openai-codex",
       "members": ["openai-codex-2"],
-      "enabled": true
+      "enabled": true,
+      "asProvider": true
     }
   ],
   "chains": [

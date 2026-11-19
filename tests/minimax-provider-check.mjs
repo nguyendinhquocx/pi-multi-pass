@@ -14,31 +14,34 @@ try {
 		"minimax-cn-2": { type: "api_key", key: "test-china" },
 	}));
 
-	const result = spawnSync(
-		"pi",
-		[
-			"--mode",
-			"rpc",
-			"--offline",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
-			"--extension",
-			join(root, "extensions", "multi-sub.ts"),
-		],
-		{
-			cwd: root,
-			env: {
-				...process.env,
-				PI_CODING_AGENT_DIR: agentDir,
-				MULTI_SUB: "minimax:1,minimax-cn:1",
-			},
-			input: '{"id":"models","type":"get_available_models"}\n',
-			encoding: "utf8",
-			timeout: 15_000,
+	function piCommand(args) {
+		if (process.platform !== "win32") return ["pi", args];
+		const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+		return ["bash", ["-lc", `pi ${args.map(quote).join(" ")}`]];
+	}
+
+	const [piBin, piArgs] = piCommand([
+		"--mode",
+		"rpc",
+		"--offline",
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-context-files",
+		"--extension",
+		join(root, "extensions", "multi-sub.ts"),
+	]);
+	const result = spawnSync(piBin, piArgs, {
+		cwd: root,
+		env: {
+			...process.env,
+			PI_CODING_AGENT_DIR: agentDir,
+			MULTI_SUB: "minimax:1,minimax-cn:1",
 		},
-	);
+		input: '{"id":"models","type":"get_available_models"}\n',
+		encoding: "utf8",
+		timeout: 15_000,
+	});
 
 	assert.equal(result.error, undefined, result.error?.message);
 	assert.equal(result.status, 0, result.stderr);

@@ -8,7 +8,7 @@ const source = await readFile(
 );
 
 assert.match(source, /function isTerminalOAuthRefreshError\(errorMessage: string\)/);
-assert.match(source, /providersRequiringReauthentication\.add\(providerName\)/);
+assert.match(source, /providersRequiringReauthentication\.add\(memberProviderName\)/);
 assert.match(source, /\[reauthentication required\]/);
 assert.match(
 	source,
