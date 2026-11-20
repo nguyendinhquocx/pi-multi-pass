@@ -196,6 +196,32 @@ export default function (pi) {
 				assert.ok(failure?.message.includes("Failed to save pool membership"), JSON.stringify(failure));
 				assert.ok(failure.message.includes("unchanged"), failure.message);
 				assert.equal(readFileSync(configPath, "utf8"), before, "config must stay untouched on save failure");
+			} else if (phase === "pool-members-move") {
+				// /pool list -> pool -> members editor: adding a member that is
+				// already in another pool must move it (one-pool-per-account)
+				// through the editPoolMembers mutation path itself.
+				script = [
+					{ pick: includes("openai-codex-pool") }, // Pools list
+					{ pick: startsWith("members") }, // pool action menu (title = pool name)
+					{
+						capture: (_title, options) => {
+							assert.ok(options.some((option) => option.startsWith("add openai-codex-3")), options.join(" | "));
+							assert.ok(options.some((option) => option.startsWith("remove openai-codex-5")), options.join(" | "));
+						},
+						pick: startsWith("add openai-codex-3"),
+					},
+					{ pick: startsWith("save") }, // persist member changes
+					{ pick: undefined }, // second Pools pass closes /pool list
+				];
+				await commands.get("pool").handler("list", context());
+				const note = notifications.map((n) => n.message).join("\n");
+				assert.ok(note.includes("Moved out of: work-codex."), note);
+				const config = readConfig();
+				assert.deepEqual(config.pools.find((pool) => pool.name === "openai-codex-pool")?.members, ["openai-codex-5", "openai-codex-3"]);
+				assert.deepEqual(config.pools.find((pool) => pool.name === "work-codex")?.members, [], "emptied routing pool is kept");
+				const providers = new Set(ctx.modelRegistry.getAll().map((model) => model.provider));
+				assert.ok(!providers.has("openai-codex-3"), "member added to the virtual pool hides behind it");
+				assert.ok(providers.has("openai-codex-2"), "unpooled account stays visible");
 			} else if (phase === "copilot-provider") {
 				script = [
 					{ pick: includes("GitHub Copilot #2") },

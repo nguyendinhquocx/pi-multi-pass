@@ -73,20 +73,31 @@ function getSwitchableProviderNames({ baseProviders, subscriptions, hasAuth, all
   return names;
 }
 
-function resolveSwitchTargetModel({ providerName, preferredModelId, hasAuth, providerModels, baseProviderLookup }) {
+function resolveSwitchTargetModel({
+  providerName,
+  preferredModelId,
+  hasAuth,
+  providerModels,
+  baseProviderLookup,
+  virtualPoolNames = [],
+  constructFallback,
+}) {
   if (!hasAuth(providerName)) return undefined;
-  const models = providerModels[providerName] || [];
-  if (preferredModelId && models.some((model) => model.id === preferredModelId)) {
-    return models.find((model) => model.id === preferredModelId);
+  // Registered instances win: visible accounts resolve through the registry.
+  if (preferredModelId && providerModels[providerName]?.some((model) => model.id === preferredModelId)) {
+    return providerModels[providerName].find((model) => model.id === preferredModelId);
+  }
+  if (virtualPoolNames.includes(providerName)) {
+    return providerModels[providerName]?.[0];
   }
   const baseProvider = baseProviderLookup(providerName);
   if (!baseProvider) return undefined;
-  const baseModels = providerModels[baseProvider] || [];
-  for (const baseModel of baseModels) {
-    const candidate = models.find((model) => model.id === baseModel.id);
+  for (const baseModel of providerModels[baseProvider] || []) {
+    const candidate = providerModels[providerName]?.find((model) => model.id === baseModel.id);
     if (candidate) return candidate;
   }
-  return undefined;
+  // Hidden Virtual Pool members have an empty catalog: construct instead.
+  return constructFallback ? constructFallback(preferredModelId) : undefined;
 }
 
 function runAllowedProviderFilteringCheck() {
@@ -191,6 +202,30 @@ function runDirectMemberModelChecks() {
   });
   assert.equal(fallback?.id, "gpt-6-luna");
   assert.equal(fallback?.contextWindow, 1_050_000, "base override applies when the member has none");
+
+  // The full switch resolution for a hidden member: registry lookups miss,
+  // then the constructed fallback supplies a valid model.
+  const hiddenResolution = resolveSwitchTargetModel({
+    providerName: "openai-codex-3",
+    preferredModelId: "gpt-6-luna",
+    hasAuth: () => true,
+    providerModels: {
+      "openai-codex": [{ id: "gpt-6-luna", contextWindow: 400_000 }, { id: "gpt-6.3-codex", contextWindow: 400_000 }],
+      "openai-codex-3": [],
+    },
+    baseProviderLookup: (providerName) => providerName.replace(/-\d+$/, ""),
+    constructFallback: (preferred) => buildDirectMemberModel({
+      memberName: "openai-codex-3",
+      baseProvider: "openai-codex",
+      catalog,
+      overridesByProvider: overrides,
+      preferredModelId: preferred,
+      credentialFor: () => ({ type: "oauth" }),
+    }),
+  });
+  assert.equal(hiddenResolution?.provider, "openai-codex-3");
+  assert.equal(hiddenResolution?.id, "gpt-6-luna");
+  assert.equal(hiddenResolution?.contextWindow, 900_000, "member override must win through the full switch path");
 
   // An empty catalog means no selectable model.
   assert.equal(

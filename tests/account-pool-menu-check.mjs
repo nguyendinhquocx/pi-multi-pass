@@ -114,6 +114,20 @@ try {
 	await runPhase("move-and-unpool");
 	await runPhase("cancel");
 
+	// exercise the /pool list members editor: adding a member that belongs to
+	// another pool must move it through editPoolMembers itself
+	writeConfig([
+		{ name: "openai-codex-pool", baseProvider: "openai-codex", members: ["openai-codex-5"], enabled: true, asProvider: true, strategy: "round-robin" },
+		{ name: "work-codex", baseProvider: "openai-codex", members: ["openai-codex-3"], enabled: true },
+	]);
+	await runPhase("pool-members-move");
+
+	// save-failure needs free 2 unpooled so picking the pool actually mutates
+	// (picking the current pool would short-circuit with "Already in ...").
+	writeConfig([
+		{ name: "openai-codex-pool", baseProvider: "openai-codex", members: ["openai-codex-3"], enabled: true, asProvider: true, strategy: "round-robin" },
+		{ name: "work-codex", baseProvider: "openai-codex", members: [], enabled: true },
+	]);
 	chmodSync(configPath, 0o444);
 	try {
 		await runPhase("save-failure");

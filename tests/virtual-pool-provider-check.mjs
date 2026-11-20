@@ -113,6 +113,25 @@ try {
   assert.equal(sharedMemberResult.status, 0, sharedMemberResult.stderr);
   assert.ok((sharedMemberResult.stdout || "").includes("openai-codex-2"), "shared members must stay selectable for standard pools");
 
+  // An empty Virtual Pool must not register as a /model provider: it is kept
+  // in the config for reuse, and its chain reference survives untouched.
+  writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
+    subscriptions: [{ provider: "openai-codex", index: 2 }],
+    pools: [{ name: "openai-codex-pool", baseProvider: "openai-codex", members: [], enabled: true, asProvider: true, strategy: "round-robin" }],
+    chains: [{ name: "chain", entries: [{ pool: "openai-codex-pool", model: "gpt-6-luna", enabled: true }], enabled: true }],
+    presets: [],
+  }));
+  const emptyPoolResult = runPi([
+    "--list-models", "--no-extensions", "--extension", join(root, "extensions", "multi-sub.ts"),
+  ], { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir }, encoding: "utf8", timeout: 30_000 });
+  assert.equal(emptyPoolResult.status, 0, emptyPoolResult.stderr);
+  const emptyPoolProviders = (emptyPoolResult.stdout || "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim())
+    .map((line) => line.trim().split(/\s+/)[0]);
+  assert.ok(!emptyPoolProviders.includes("openai-codex-pool"), "an empty pool must not register as a /model provider");
+  assert.ok(emptyPoolProviders.includes("openai-codex-2"), "accounts stay visible around an empty pool");
+
   writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
     subscriptions: [
       { provider: "openai-codex", index: 2 },

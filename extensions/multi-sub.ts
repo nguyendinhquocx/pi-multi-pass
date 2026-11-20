@@ -2683,34 +2683,9 @@ function findSelectableModelForProvider(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!getAuthStorage(ctx).hasAuth(providerName)) {
-		return undefined;
-	}
-	if (preferredModelId) {
-		const preferred = ctx.modelRegistry.find(providerName, preferredModelId);
-		if (preferred) {
-			return preferred as Model<Api>;
-		}
-	}
-	const virtualPool = loadEffectiveConfig(ctx.cwd).pools.find(
-		(pool) => pool.name === providerName && pool.enabled && isVirtualPool(pool),
-	);
-	if (virtualPool) {
-		return ctx.modelRegistry.getAll().find((model) => model.provider === providerName) as Model<Api> | undefined;
-	}
-	const baseProvider = getBaseProvider(providerName);
-	if (!baseProvider) {
-		return undefined;
-	}
-	for (const baseModel of minimaxBase(providerName)
-		? providerModelChoices(ctx, providerName)
-		: getModels(baseProvider as any) as Model<Api>[]) {
-		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
-		if (candidate) {
-			return candidate as Model<Api>;
-		}
-	}
-	return undefined;
+	// Same resolution rules as the /subs switch path so a hidden Virtual Pool
+	// member stays switchable under project-restricted auto-switching too.
+	return resolveSwitchTargetModel(ctx, providerName, preferredModelId);
 }
 
 function formatAllowedProviderSummary(effective: EffectiveConfig): string | undefined {
@@ -4074,6 +4049,9 @@ function registerVirtualPoolProvider(
 	poolManager: PoolManager,
 ): boolean {
 	if (!pool.enabled || !isVirtualPool(pool) || !PROVIDER_TEMPLATES[pool.baseProvider]) return false;
+	// An empty pool is kept in the config for reuse but must not surface as a
+	// /model provider: there is no member to authenticate a request with.
+	if (pool.members.length === 0) return false;
 	if (SUPPORTED_PROVIDERS.includes(pool.name) || BUILTIN_PROVIDER_IDS.has(pool.name)) return false;
 	if (!virtualPoolProviderNames.has(pool.name)) {
 		const configured = runtimeModelRegistry?.getRegisteredProviderConfig(pool.name)
@@ -4331,11 +4309,16 @@ function buildDirectMemberModel(
 		...storedContextWindowOverrides(baseProvider),
 		...storedContextWindowOverrides(memberName),
 	};
+	// Keep the account label (email/#index) so the model footer still names
+	// the member it routes to, matching liveSubscriptionModels.
+	const subEntry = normalizeEntries(mergeConfigs(loadGlobalConfig(), parseEnvConfig()))
+		.find((candidate) => subProviderName(candidate) === memberName);
 	const buildCandidate = (modelId: string): Model<Api> | undefined => {
 		const entry = catalog.find((item) => item.model.id === modelId);
 		if (!entry) return undefined;
 		return {
 			...entry.model,
+			name: subEntry ? subModelName(subEntry, entry.model.name) : entry.model.name,
 			contextWindow: contextWindowOverrides[modelId] ?? entry.model.contextWindow,
 			provider: memberName,
 		};
