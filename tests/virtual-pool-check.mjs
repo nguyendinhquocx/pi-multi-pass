@@ -5,6 +5,11 @@ assert.equal(isVirtualPool({ name: "work-codex", baseProvider: "openai-codex" })
 assert.equal(isVirtualPool({ name: "openai-codex-free", baseProvider: "openai-codex" }), true);
 assert.equal(isVirtualPool({ name: "work-codex", baseProvider: "openai-codex", asProvider: true }), true);
 assert.equal(isVirtualPool({ name: "openai-codex-free", baseProvider: "openai-codex", asProvider: false }), false);
+// The `<base>-pool` naming convention alone must not turn a standard pool
+// into a Virtual Provider; only explicit asProvider (or legacy `*-free`) does.
+assert.equal(isVirtualPool({ name: "openai-codex-pool", baseProvider: "openai-codex" }), false);
+assert.equal(isVirtualPool({ name: "openai-codex-pool", baseProvider: "openai-codex", asProvider: true }), true);
+assert.equal(isVirtualPool({ name: "work-codex-pool", baseProvider: "openai-codex" }), false);
 
 const members = ["openai-codex-2", "openai-codex-3", "openai-codex-4"];
 assert.deepEqual(

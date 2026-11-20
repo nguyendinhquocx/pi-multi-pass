@@ -130,7 +130,107 @@ function runFallbackModelCheck() {
   assert.equal(model?.id, "gpt-5.3-codex");
 }
 
+// Mirror of extensions/multi-sub.ts::buildDirectMemberModel — the fallback
+// that constructs a model for a Virtual Pool member whose catalog is hidden.
+function buildDirectMemberModel({ memberName, baseProvider, catalog, overridesByProvider, preferredModelId, credentialFor, modifyModelsBuilder }) {
+  if (!catalog || catalog.length === 0) return undefined;
+  const contextWindowOverrides = {
+    ...(overridesByProvider[baseProvider] || {}),
+    ...(overridesByProvider[memberName] || {}),
+  };
+  const buildCandidate = (modelId) => {
+    const item = catalog.find((entry) => entry.id === modelId);
+    if (!item) return undefined;
+    return {
+      ...item,
+      contextWindow: contextWindowOverrides[modelId] ?? item.contextWindow,
+      provider: memberName,
+    };
+  };
+  let model = (preferredModelId ? buildCandidate(preferredModelId) : undefined) ?? buildCandidate(catalog[0].id);
+  if (!model) return undefined;
+  const credential = credentialFor(memberName);
+  const modifyModels = modifyModelsBuilder ? modifyModelsBuilder(memberName) : undefined;
+  if (credential && modifyModels) model = modifyModels([model], credential)[0] ?? model;
+  return model;
+}
+
+function runDirectMemberModelChecks() {
+  const catalog = [
+    { id: "gpt-6-luna", contextWindow: 400_000, api: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/" },
+    { id: "gpt-6.3-codex", contextWindow: 400_000, api: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/" },
+  ];
+  const overrides = {
+    "openai-codex": { "gpt-6-luna": 1_050_000 },
+    "openai-codex-3": { "gpt-6-luna": 900_000 },
+  };
+
+  // Preferred model id survives; member override beats the base override.
+  const preferred = buildDirectMemberModel({
+    memberName: "openai-codex-3",
+    baseProvider: "openai-codex",
+    catalog,
+    overridesByProvider: overrides,
+    preferredModelId: "gpt-6-luna",
+    credentialFor: () => ({ type: "oauth" }),
+  });
+  assert.equal(preferred?.id, "gpt-6-luna");
+  assert.equal(preferred?.provider, "openai-codex-3");
+  assert.equal(preferred?.contextWindow, 900_000);
+  assert.equal(preferred?.api, "openai-responses");
+  assert.equal(preferred?.baseUrl, "https://chatgpt.com/backend-api/");
+
+  // Unknown preferred id falls back to the first valid base catalog model.
+  const fallback = buildDirectMemberModel({
+    memberName: "openai-codex-5",
+    baseProvider: "openai-codex",
+    catalog,
+    overridesByProvider: overrides,
+    preferredModelId: "gpt-not-real",
+    credentialFor: () => ({ type: "oauth" }),
+  });
+  assert.equal(fallback?.id, "gpt-6-luna");
+  assert.equal(fallback?.contextWindow, 1_050_000, "base override applies when the member has none");
+
+  // An empty catalog means no selectable model.
+  assert.equal(
+    buildDirectMemberModel({
+      memberName: "openai-codex-5",
+      baseProvider: "openai-codex",
+      catalog: [],
+      overridesByProvider: {},
+      credentialFor: () => undefined,
+    }),
+    undefined,
+  );
+
+  // Provider-specific transforms (e.g. copilot baseUrl) apply to the member model.
+  const transformed = buildDirectMemberModel({
+    memberName: "github-copilot-2",
+    baseProvider: "github-copilot",
+    catalog: [{ id: "gpt-5", contextWindow: 128_000, baseUrl: "https://api.githubcopilot.com" }],
+    overridesByProvider: {},
+    credentialFor: (name) => (name === "github-copilot-2" ? { type: "oauth", access: "tok" } : undefined),
+    modifyModelsBuilder: (name) => (models, credentials) =>
+      models.map((model) => (model.provider === name ? { ...model, baseUrl: `https://routed.${credentials.access}.example` } : model)),
+  });
+  assert.equal(transformed?.baseUrl, "https://routed.tok.example");
+  assert.equal(transformed?.provider, "github-copilot-2");
+
+  // No credential means no transform, but the model is still returned.
+  const untransformed = buildDirectMemberModel({
+    memberName: "github-copilot-2",
+    baseProvider: "github-copilot",
+    catalog: [{ id: "gpt-5", contextWindow: 128_000, baseUrl: "https://api.githubcopilot.com" }],
+    overridesByProvider: {},
+    credentialFor: () => undefined,
+    modifyModelsBuilder: () => (models) => models.map((model) => ({ ...model, baseUrl: "https://should-not-apply.example" })),
+  });
+  assert.equal(untransformed?.baseUrl, "https://api.githubcopilot.com");
+}
+
 runAllowedProviderFilteringCheck();
 runPreferredModelCheck();
 runFallbackModelCheck();
+runDirectMemberModelChecks();
 console.log("subs switch checks passed");

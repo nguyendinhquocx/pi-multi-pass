@@ -49,6 +49,12 @@ import lockfile from "proper-lockfile";
 import { decodeShareText, encodeShareFrames, encodeShareText, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
 import { setMultiPassLanguage, translateUiText, translateUiValue, type MultiPassLanguage } from "../lib/i18n.ts";
 import { chooseVirtualPoolMember, isVirtualPool } from "../lib/virtual-pool.ts";
+import {
+	applyPoolMembership,
+	defaultPoolName,
+	findDuplicateMembershipMembers,
+	findMemberPools,
+} from "../lib/pool-membership.ts";
 import { classifyCodexQuotaKind, getCodexWindowRemaining, parseCodexUsageSnapshot } from "../lib/codex-quota.ts";
 import { prepareBuiltinLogin } from "../lib/login-handoff.ts";
 import { formatSubscriptionChoiceLabel } from "../lib/subscription-labels.ts";
@@ -4284,6 +4290,7 @@ function resolveSwitchTargetModel(
 	if (!baseProvider) {
 		return undefined;
 	}
+	// Registered instances win: a visible account resolves through the registry.
 	for (const baseModel of minimaxBase(providerName)
 		? providerModelChoices(ctx, providerName)
 		: getModels(baseProvider as any) as Model<Api>[]) {
@@ -4292,7 +4299,56 @@ function resolveSwitchTargetModel(
 			return candidate as Model<Api>;
 		}
 	}
-	return undefined;
+	// Virtual Pool members are registered with an empty catalog, so the
+	// registry lookup above fails. Construct a direct-switch model from the
+	// base provider's builtin + models-store catalog instead.
+	return buildDirectMemberModel(ctx, providerName, baseProvider, preferredModelId);
+}
+
+/** Construct a switchable model for a subscription whose catalog is hidden
+ *  behind a Virtual Pool: builtin + models-store catalog of the base
+ *  provider, context overrides in base → member order, then the member's
+ *  OAuth `modifyModels` transformation. Minimax keeps its overlay-only
+ *  choice set via `providerModelChoices` on the base provider. */
+function buildDirectMemberModel(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	memberName: string,
+	baseProvider: string,
+	preferredModelId?: string,
+): Model<Api> | undefined {
+	const catalog = subscriptionCatalog(baseProvider);
+	if (catalog.length === 0) return undefined;
+	let candidateIds: string[];
+	if (minimaxBase(memberName)) {
+		const live = providerModelChoices(ctx, baseProvider);
+		candidateIds = live.length > 0
+			? live.map((model) => model.id)
+			: catalog.map(({ model }) => model.id);
+	} else {
+		candidateIds = catalog.map(({ model }) => model.id);
+	}
+	const contextWindowOverrides = {
+		...storedContextWindowOverrides(baseProvider),
+		...storedContextWindowOverrides(memberName),
+	};
+	const buildCandidate = (modelId: string): Model<Api> | undefined => {
+		const entry = catalog.find((item) => item.model.id === modelId);
+		if (!entry) return undefined;
+		return {
+			...entry.model,
+			contextWindow: contextWindowOverrides[modelId] ?? entry.model.contextWindow,
+			provider: memberName,
+		};
+	};
+	let model = (preferredModelId ? buildCandidate(preferredModelId) : undefined)
+		?? buildCandidate(candidateIds[0]);
+	if (!model) return undefined;
+	const credential = getAuthStorage(ctx).get(memberName);
+	const modifyModels = PROVIDER_TEMPLATES[baseProvider]?.buildModifyModels?.(memberName);
+	if (credential && modifyModels) {
+		model = modifyModels([model], credential as OAuthCredentials)[0] ?? model;
+	}
+	return model;
 }
 
 interface ModelPickerItem {
@@ -4675,6 +4731,9 @@ async function showSubscriptionActions(
 	const hasAuth = authStorage.hasAuth(name);
 	const auth = authStorage.get(name);
 	const needsReauthentication = providersRequiringReauthentication.has(name);
+	// Membership state must reflect the latest config, not the snapshot taken
+	// when /subs list opened (the user may have just moved this account).
+	const membershipDescription = describePoolMembershipState(loadGlobalConfig().pools, name);
 	const actionItems: SelectItem[] = [
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		...(hasAuth && auth?.type === "oauth"
@@ -4689,6 +4748,7 @@ async function showSubscriptionActions(
 		hasAuth
 			? { value: "logout", label: "logout", description: "Log out this subscription" }
 			: { value: "login", label: "login", description: "Show login instructions" },
+		{ value: "pool-membership", label: "Pool membership", description: membershipDescription },
 		{ value: "remove", label: "remove", description: "Remove this subscription" },
 	];
 
@@ -4731,8 +4791,174 @@ async function showSubscriptionActions(
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
 	}
+	if (action === "pool-membership") {
+		return showPoolMembershipMenu(pi, ctx, entry, poolManager);
+	}
 	if (action === "remove") {
 		return removeSubscriptionEntry(pi, ctx, config, entry, poolManager);
+	}
+}
+
+/** One-line membership state for the account action row: `No pool`,
+ *  `Currently in <pool>`, or an explicit legacy-conflict warning. */
+function describePoolMembershipState(pools: PoolConfig[], member: string): string {
+	const memberPools = findMemberPools(pools, member);
+	if (memberPools.length === 0) return "No pool";
+	if (memberPools.length === 1) return `Currently in ${memberPools[0].name}`;
+	return `In multiple pools: ${memberPools.map((pool) => pool.name).join(", ")} (select a pool to resolve)`;
+}
+
+/** /subs account menu -> Pool membership. Lists every pool sharing the
+ *  account's base provider, moves/unpools the account, or creates the
+ *  default `<baseProvider>-pool` Virtual Provider. Each selection saves
+ *  immediately; Escape returns without touching the config. */
+async function showPoolMembershipMenu(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	entry: SubEntry,
+	poolManager: PoolManager,
+): Promise<void> {
+	const member = subProviderName(entry);
+	const displayName = subDisplayName(entry);
+	const baseProvider = entry.provider;
+	const config = loadGlobalConfig();
+	const authStorage = getAuthStorage(ctx);
+	const sameProviderPools = config.pools.filter((pool) => pool.baseProvider === baseProvider);
+	const hasVirtualPool = sameProviderPools.some((pool) => pool.enabled && isVirtualPool(pool));
+	const duplicateMembers = findDuplicateMembershipMembers(config.pools);
+	const currentPools = findMemberPools(config.pools, member);
+	const activeMember = ctx.model?.provider === member;
+
+	const items: SelectItem[] = sameProviderPools.map((pool) => {
+		const memberEmails = pool.members
+			.map((candidate) => getStoredAccountEmail(candidate, authStorage))
+			.filter((candidateEmail): candidateEmail is string => Boolean(candidateEmail));
+		const loggedInCount = pool.members.filter((candidate) => authStorage.hasAuth(candidate)).length;
+		const kind = isVirtualPool(pool) ? "Virtual Provider" : "Routing Pool";
+		const details = [
+			kind,
+			`${pool.members.length} member${pool.members.length === 1 ? "" : "s"}${memberEmails.length > 0 ? `: ${memberEmails.join(", ")}` : ""}`,
+			`${loggedInCount}/${pool.members.length} logged in`,
+			pool.enabled ? undefined : "disabled",
+			currentPools.length === 1 && currentPools[0].name === pool.name ? "current" : undefined,
+		];
+		if (duplicateMembers.some((candidate) => pool.members.includes(candidate))) {
+			details.push("conflicting membership (select to resolve)");
+		}
+		return {
+			value: `pool:${pool.name}`,
+			label: pool.name,
+			description: details.filter(Boolean).join(" · "),
+		};
+	});
+	items.push({
+		value: "no-pool",
+		label: "No pool",
+		description: "Remove this account from every pool of this provider",
+	});
+	if (!hasVirtualPool) {
+		items.push({
+			value: "create-default",
+			label: `Create ${defaultPoolName(config.pools, baseProvider)}`,
+			description: "New Virtual Provider pool (round-robin) with this account",
+		});
+	}
+
+	const action = await showWrappedSelect(ctx, {
+		title: `Pool membership: ${displayName}`,
+		subtitle: describePoolMembershipState(config.pools, member)
+			+ "\nSelecting a pool moves the account there; Escape changes nothing.",
+		items,
+		initialValue: currentPools.length === 1 ? `pool:${currentPools[0].name}` : undefined,
+		confirmHint: "select",
+		cancelHint: "back",
+	});
+	if (!action) return;
+
+	const saveOrRollback = async (): Promise<boolean> => {
+		try {
+			saveGlobalConfig(config);
+			return true;
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(
+				`Failed to save pool membership: ${reason}.\nThe config on disk is unchanged; resolve the issue and pick the pool again.`,
+				"error",
+			);
+			return false;
+		}
+	};
+	const activeMemberNote = (poolName: string) => activeMember
+		? ` The current session keeps ${member}; pick "${poolName}" in /model to use the pool.`
+		: "";
+
+	if (action === "no-pool") {
+		if (currentPools.length === 0) {
+			ctx.ui.notify(`${displayName} is not in any pool.`, "info");
+			return;
+		}
+		const wasInVirtualPool = currentPools.some((pool) => isVirtualPool(pool));
+		applyPoolMembership(config.pools, member, null);
+		if (!await saveOrRollback()) return;
+		await reloadPoolManagerForCurrentProject(ctx, poolManager);
+		const visibility = wasInVirtualPool
+			? ` ${displayName} is selectable again as its own provider in /model.`
+			: "";
+		ctx.ui.notify(
+			`Removed ${displayName} from: ${currentPools.map((pool) => pool.name).join(", ")}.${visibility}${activeMemberNote("No pool")}`,
+			"info",
+		);
+		return;
+	}
+
+	if (action === "create-default") {
+		const poolName = defaultPoolName(config.pools, baseProvider);
+		const built = buildPoolConfig({
+			name: poolName,
+			baseProvider,
+			members: [member],
+			enabled: true,
+			strategy: "round-robin",
+		});
+		if (!built.ok) {
+			ctx.ui.notify(built.error, "warning");
+			return;
+		}
+		built.pool.asProvider = true;
+		built.pool.strategy = "round-robin";
+		persistPoolConfig(config, built.pool);
+		const leftPools = applyPoolMembership(config.pools, member, built.pool.name).removedFrom;
+		if (!await saveOrRollback()) return;
+		await reloadPoolManagerForCurrentProject(ctx, poolManager);
+		const leftSuffix = leftPools.length > 0 ? ` Left: ${leftPools.join(", ")}.` : "";
+		ctx.ui.notify(
+			`Created pool "${built.pool.name}" (Virtual Provider, round-robin) with ${displayName}.${leftSuffix}${activeMemberNote(built.pool.name)}`,
+			"info",
+		);
+		return;
+	}
+
+	if (action.startsWith("pool:")) {
+		const targetPool = config.pools.find((pool) => pool.name === action.slice("pool:".length));
+		if (!targetPool) {
+			ctx.ui.notify("That pool no longer exists. Reopen the menu to refresh.", "warning");
+			return;
+		}
+		if (currentPools.length === 1 && currentPools[0].name === targetPool.name) {
+			ctx.ui.notify(`${displayName} is already in ${targetPool.name}.`, "info");
+			return;
+		}
+		const result = applyPoolMembership(config.pools, member, targetPool.name);
+		if (!await saveOrRollback()) return;
+		await reloadPoolManagerForCurrentProject(ctx, poolManager);
+		const targetKind = isVirtualPool(targetPool) ? "Virtual Provider" : "Routing Pool";
+		const moveOrAdd = result.removedFrom.length > 0
+			? `Moved ${displayName} from: ${result.removedFrom.join(", ")} to ${targetPool.name} (${targetKind}).`
+			: `Added ${displayName} to ${targetPool.name} (${targetKind}).`;
+		const visibility = isVirtualPool(targetPool)
+			? ` ${displayName} is now hidden behind the ${targetPool.name} provider in /model.`
+			: ` ${displayName} keeps its own provider row in /model.`;
+		ctx.ui.notify(`${moveOrAdd}${visibility}${activeMemberNote(targetPool.name)}`, "info");
 	}
 }
 
@@ -4937,12 +5163,14 @@ async function showBuiltinProviderInfo(
 async function handleSubsList(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
-	config: MultiPassConfig,
 	poolManager: PoolManager,
 ): Promise<void> {
 	let preferredProviderName: string | undefined = ctx.model?.provider;
 
 	while (true) {
+		// Reload per iteration: pool membership changes from the account menu
+		// must be reflected on the next pass without reopening /subs.
+		const config = loadGlobalConfig();
 		const envEntries = parseEnvConfig();
 		const all = normalizeEntries(mergeConfigs(config, envEntries));
 		const authStorage = getAuthStorage(ctx);
@@ -5415,6 +5643,24 @@ function renamePoolReferences(
 	return updatedEntries;
 }
 
+/** Renaming a pool must keep preset entries that route through it working;
+ *  preset entries reference pools by their provider name. */
+function renamePoolPresetReferences(
+	presets: PresetConfig[],
+	previousName: string,
+	nextName: string,
+): number {
+	let updatedEntries = 0;
+	for (const preset of presets) {
+		for (const entry of preset.entries) {
+			if (entry.provider !== previousName) continue;
+			entry.provider = nextName;
+			updatedEntries += 1;
+		}
+	}
+	return updatedEntries;
+}
+
 function pruneRemovedPoolReferences(
 	chains: ChainConfig[],
 	removedPoolNames: Set<string>,
@@ -5465,11 +5711,20 @@ async function renamePoolConfig(
 	pool.name = trimmedName;
 	if (wasVirtualProvider) pool.asProvider = true;
 	const updatedEntries = renamePoolReferences(config.chains, previousName, trimmedName);
+	const updatedPresetEntries = renamePoolPresetReferences(config.presets, previousName, trimmedName);
 	saveGlobalConfig(config);
 	await reloadPoolManagerForCurrentProject(ctx, poolManager);
-	ctx.ui.notify(
+	const referenceSummary = [
 		updatedEntries > 0
-			? `Renamed pool "${previousName}" -> "${trimmedName}" and updated ${updatedEntries} chain entr${updatedEntries === 1 ? "y" : "ies"}.`
+			? `${updatedEntries} chain entr${updatedEntries === 1 ? "y" : "ies"}`
+			: undefined,
+		updatedPresetEntries > 0
+			? `${updatedPresetEntries} preset entr${updatedPresetEntries === 1 ? "y" : "ies"}`
+			: undefined,
+	].filter(Boolean).join(" and ");
+	ctx.ui.notify(
+		referenceSummary
+			? `Renamed pool "${previousName}" -> "${trimmedName}" and updated ${referenceSummary}.`
 			: `Renamed pool "${previousName}" -> "${trimmedName}".`,
 		"info",
 	);
@@ -5524,22 +5779,29 @@ async function editPoolMembers(
 		if (!action) return;
 
 		if (action === "save") {
-			const validation = createPoolValidationMessage(selectedMembers);
-			if (validation) {
-				ctx.ui.notify(validation, "warning");
-				continue;
-			}
 			const changed = pool.members.length !== selectedMembers.length
 				|| pool.members.some((member, index) => member !== selectedMembers[index]);
 			if (!changed) {
 				ctx.ui.notify(`No changes for pool "${pool.name}".`, "info");
 				return;
 			}
+			const addedMembers = selectedMembers.filter((member) => !pool.members.includes(member));
 			pool.members = [...selectedMembers];
+			// One-pool-per-account: a newly added member leaves every other pool
+			// with the same base provider; empty pools are kept for reuse.
+			const leftPools = new Set<string>();
+			for (const member of addedMembers) {
+				for (const previousPool of applyPoolMembership(config.pools, member, pool.name).removedFrom) {
+					leftPools.add(previousPool);
+				}
+			}
 			saveGlobalConfig(config);
 			await reloadPoolManagerForCurrentProject(ctx, poolManager);
+			const leftSuffix = leftPools.size > 0
+				? ` Moved out of: ${[...leftPools].join(", ")}.`
+				: "";
 			ctx.ui.notify(
-				`Updated pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.`,
+				`Updated pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ") || "empty pool kept for reuse"}.${leftSuffix}`,
 				"info",
 			);
 			return;
@@ -5755,14 +6017,23 @@ async function createAndPersistPool(
 
 	const config = loadGlobalConfig();
 	const persisted = persistPoolConfig(config, pool);
+	// One-pool-per-account: members picked for this pool leave every other
+	// pool with the same base provider.
+	const leftPools = new Set<string>();
+	for (const member of pool.members) {
+		for (const previousPool of applyPoolMembership(persisted.config.pools, member, pool.name).removedFrom) {
+			leftPools.add(previousPool);
+		}
+	}
 	saveGlobalConfig(persisted.config);
 	await reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 	const resumeSuffix = options?.resumeChainName
 		? ` Chain builder resumed for "${options.resumeChainName}".`
 		: "";
+	const leftSuffix = leftPools.size > 0 ? ` Moved out of: ${[...leftPools].join(", ")}.` : "";
 	ctx.ui.notify(
-		`${persisted.action === "created" ? "Created" : "Updated"} pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.${resumeSuffix}`,
+		`${persisted.action === "created" ? "Created" : "Updated"} pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.${leftSuffix}${resumeSuffix}`,
 		"info",
 	);
 	return pool;
@@ -7334,7 +7605,7 @@ async function handleSubsMenu(
 		const config = loadGlobalConfig();
 		switch (action) {
 			case "list":
-				await handleSubsList(pi, ctx, config, poolManager);
+				await handleSubsList(pi, ctx, poolManager);
 				break;
 			case "add":
 				await handleSubsAdd(pi, ctx);
@@ -8291,7 +8562,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			switch (subcommand) {
 				case "list":
 				case "ls":
-					return handleSubsList(pi, ctx, config, poolManager);
+					return handleSubsList(pi, ctx, poolManager);
 				case "add":
 				case "new":
 					return handleSubsAdd(pi, ctx);
