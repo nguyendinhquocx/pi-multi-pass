@@ -246,6 +246,23 @@ export default function (pi) {
 				const providers = new Set(ctx.modelRegistry.getAll().map((model) => model.provider));
 				assert.ok(providers.has("github-copilot-pool"), "copilot virtual provider must register");
 				assert.ok(!providers.has("github-copilot-2"), "copilot member hides behind its pool");
+			} else if (phase === "dashboard-meta") {
+				// Dashboard rows must expose pool membership at a glance.
+				script = [
+					{
+						capture: (_title, options) => {
+							const virtualRow = options.find((option) => option.startsWith("free 1"));
+							assert.ok(virtualRow?.includes("pool: openai-codex-pool"), `virtual member row must carry pool badge: ${options.join(" | ")}`);
+							const routingRow = options.find((option) => option.startsWith("plus"));
+							assert.ok(routingRow?.includes("pool: work-codex"), `routing member row must carry pool badge: ${options.join(" | ")}`);
+							const unpooled = options.find((option) => option.startsWith("free 2"));
+							assert.ok(unpooled, `unpooled row missing: ${options.join(" | ")}`);
+							assert.ok(!unpooled.includes("pool:"), `unpooled row must not show a pool badge: ${unpooled}`);
+						},
+						pick: undefined,
+					},
+				];
+				await runSubsList();
 			} else {
 				throw new Error(`unknown phase: ${phase}`);
 			}

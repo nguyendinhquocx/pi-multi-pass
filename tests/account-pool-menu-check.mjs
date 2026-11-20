@@ -142,6 +142,9 @@ try {
 	], [{ provider: "github-copilot", index: 2 }]);
 	await runPhase("copilot-provider");
 
+	// dashboard rows expose pool membership without opening the account menu
+	await runPhase("dashboard-meta");
+
 	child.stdin.end();
 	await new Promise((resolve) => child.once("close", resolve));
 	console.log("account pool menu checks passed");

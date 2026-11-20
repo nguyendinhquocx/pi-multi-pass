@@ -5189,6 +5189,9 @@ async function handleSubsList(
 			const email = getStoredAccountEmail(name, authStorage);
 			const needsReauth = providersRequiringReauthentication.has(name);
 			const loggedIn = authStorage.hasAuth(name);
+			// Pool badge so the dashboard shows membership at a glance; a
+			// legacy duplicate surfaces as a comma-joined list.
+			const memberPools = findMemberPools(config.pools ?? [], name);
 			return {
 				value: name,
 				glyph: STATUS_BAR_GLYPHS[entry.provider] || "\u25cf",
@@ -5200,7 +5203,9 @@ async function handleSubsList(
 					: loggedIn
 						? email || "logged in"
 						: "not logged in",
-				meta: getSubscriptionSource(config, entry),
+				meta: memberPools.length > 0
+					? `${getSubscriptionSource(config, entry)} \u00b7 pool: ${memberPools.map((pool) => pool.name).join(", ")}`
+					: getSubscriptionSource(config, entry),
 				active: ctx.model?.provider === name,
 			};
 		});
