@@ -29,7 +29,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
-- **Virtual Pool Provider**: Expose a pool as one `/model` provider (for example `openai-codex-free`); member providers stay hidden while OAuth credentials remain independently managed
+- **Virtual Pool Provider**: Expose a pool as one `/model` provider (for example `openai-codex-pool`); member providers stay hidden while OAuth credentials remain independently managed. Pools can mix plans (Free/Plus/Pro)
 - **Vietnamese UI**: TUI menus and notifications default to Vietnamese; `/subs lang` toggles Vietnamese/English
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
@@ -64,7 +64,8 @@ can still reach the older models there.
 
 Set `asProvider: true` on a pool to register its name as one provider in Pi's
 `/model` catalog. The convention `<baseProvider>-free` also enables it when
-`asProvider` is omitted; an explicit `false` disables that convention. The
+`asProvider` is omitted; an explicit `false` disables that convention (a name
+ending in `-pool` alone does not). The
 member accounts stay registered for OAuth and `/subs` management, but their
 individual model catalogs are hidden. Pool models inherit `contextWindow`
 overrides from the base provider in `models.json`. Individual subscription
@@ -75,6 +76,19 @@ Pool names must not shadow a supported or built-in provider id (for example
 `openrouter`); a colliding pool keeps its member catalogs visible instead of
 breaking failover, and a member shared with a standard pool keeps its catalog
 for that pool.
+
+Pools may mix plans: any saved subscriptions of the same base provider can
+share one pool regardless of Free/Plus/Pro. One account belongs to at most one
+pool; `/subs` -> select an account -> `Pool membership` moves it between pools
+or removes it (`No pool`) without touching its OAuth credential, and can create
+the default `<baseProvider>-pool` (Virtual Provider, round-robin) when none
+exists yet. An account inside a pool is still selectable on its own through
+`/subs switch`; if it hits a rate limit, the pool's failover still applies.
+`/model` lists the Virtual Pool Provider plus every account that is not inside
+a Virtual Pool; members of a routing pool (no `asProvider`) keep their own
+provider rows because routing pools never register one. Emptying a pool keeps
+it for reuse, but it stops appearing as a `/model` provider until it has a
+member again.
 
 Use `/pool provider` or the pool's action menu to toggle this setting. The
 `/subs switch` picker puts each account email first so similar provider labels
